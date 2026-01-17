@@ -6,6 +6,10 @@ export async function onRequestPost(context) {
     return json({ error: "OPENAI_API_KEY missing in runtime env" }, 500);
   }
 
+  // ---- Auth check (token signed with ACCESS_TOKEN_SECRET) ----
+  const authErr = await requireAuth(request, env);
+  if (authErr) return authErr;
+
   // ---- Read body safely ----
   let body;
   try {
@@ -107,7 +111,8 @@ VARIANT C`;
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        model: env.OPENAI_MODEL || "gpt-5.2 Thinking",
+        // NOTE: махам "Thinking" от default-а, за да няма невалидно име на модел
+        model: env.OPENAI_MODEL || "gpt-5.2",
         instructions,
         input,
         max_output_tokens: variants === 3 ? 3200 : 1600,
@@ -150,9 +155,92 @@ VARIANT C`;
   }
 }
 
+/* -------------------- AUTH HELPERS -------------------- */
+
+async function requireAuth(request, env) {
+  if (!env?.ACCESS_TOKEN_SECRET) {
+    return json({ error: "ACCESS_TOKEN_SECRET missing in env" }, 500);
+  }
+
+  const auth = request.headers.get("authorization") || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
+
+  if (!token || !token.includes(".")) {
+    return json({ error: "Unauthorized" }, 401);
+  }
+
+  const [payloadB64, sigB64] = token.split(".");
+  if (!payloadB64 || !sigB64) {
+    return json({ error: "Unauthorized" }, 401);
+  }
+
+  const expectedSig = await hmacSha256Base64Url(env.ACCESS_TOKEN_SECRET, payloadB64);
+  if (!timingSafeEqual(sigB64, expectedSig)) {
+    return json({ error: "Unauthorized" }, 401);
+  }
+
+  let payload;
+  try {
+    payload = JSON.parse(new TextDecoder().decode(base64UrlDecode(payloadB64)));
+  } catch {
+    return json({ error: "Unauthorized" }, 401);
+  }
+
+  const now = Math.floor(Date.now() / 1000);
+  if (!payload?.exp || now >= payload.exp) {
+    return json({ error: "Session expired" }, 401);
+  }
+
+  return null;
+}
+
+async function hmacSha256Base64Url(secret, message) {
+  const key = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(secret),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+
+  const sig = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    new TextEncoder().encode(message)
+  );
+
+  return base64UrlEncode(new Uint8Array(sig));
+}
+
+function base64UrlEncode(bytes) {
+  let binary = "";
+  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function base64UrlDecode(b64url) {
+  const b64 = b64url.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((b64url.length + 3) % 4);
+  const bin = atob(b64);
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
+function timingSafeEqual(a, b) {
+  a = String(a);
+  b = String(b);
+  const len = Math.max(a.length, b.length);
+  let diff = a.length ^ b.length;
+  for (let i = 0; i < len; i++) {
+    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  }
+  return diff === 0;
+}
+
+/* -------------------- OUTPUT HELPERS -------------------- */
+
 // Extract text from Responses API output items
 function extractText(data) {
-  // Some SDKs expose output_text; keep as fallback
   if (typeof data?.output_text === "string" && data.output_text.trim()) {
     return data.output_text.trim();
   }
@@ -165,7 +253,7 @@ function extractText(data) {
       if (Array.isArray(content)) {
         for (const c of content) {
           if (c?.type === "output_text" && typeof c?.text === "string") parts.push(c.text);
-          else if (typeof c?.text === "string") parts.push(c.text); // fallback
+          else if (typeof c?.text === "string") parts.push(c.text);
         }
       }
     }

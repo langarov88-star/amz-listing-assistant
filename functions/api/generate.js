@@ -1,5 +1,9 @@
 export async function onRequestPost(context) {
   const { request, env } = context;
+  if (!env?.OPENAI_API_KEY) {
+  return json({ error: "OPENAI_API_KEY is missing in runtime env (Production)" }, 500);
+}
+
 
   try {
     const body = await request.json();

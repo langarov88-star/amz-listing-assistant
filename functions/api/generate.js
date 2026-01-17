@@ -14,14 +14,14 @@ export async function onRequestPost({ request, env }) {
   const brandVoice = String(body.brand_voice || "").trim();
   const brandName = String(body.brand_name || "").trim();
   const usp = String(body.usp || "").trim();
-  const userPrompt = String(body.user_prompt || "").trim();
+  const userPromptRaw = String(body.user_prompt || "").trim();
 
   const variantsRaw = Number(body.variants || 1);
   const variants = variantsRaw === 3 ? 3 : 1;
 
   if (!marketplace) return json({ error: "Missing marketplace" }, 400);
   if (!brandName) return json({ error: "Missing brand_name" }, 400);
-  if (!userPrompt) return json({ error: "Missing user_prompt" }, 400);
+  if (!userPromptRaw) return json({ error: "Missing user_prompt" }, 400);
 
   const langMap = {
     "amazon.de": "German (DE)",
@@ -35,12 +35,27 @@ export async function onRequestPost({ request, env }) {
   };
   const outLang = langMap[marketplace] || "English";
 
-  // ✅ ТУК: булети + описание с твърди изисквания
+  // ✅ Булети + описание с твърди изисквания
   const BULLET_COUNT = 7;
   const BULLET_MIN = 220; // chars
   const BULLET_MAX = 240; // chars
   const DESC_MIN = 3000; // chars
   const DESC_MAX = 4000; // chars
+
+  // ✅ NEW: ако user_prompt е URL -> fetch + extract
+  let userPrompt = userPromptRaw;
+  let scrapedInfo = "";
+  if (looksLikeUrl(userPromptRaw)) {
+    try {
+      const ctx = await fetchProductContext(userPromptRaw, { timeoutMs: 15000 });
+      scrapedInfo = buildProductContextText(ctx);
+      // вместо да подаваме само линк, подаваме извлечена информация
+      userPrompt = scrapedInfo || userPromptRaw;
+    } catch (e) {
+      // ако scrape падне, продължаваме само с линка
+      userPrompt = userPromptRaw;
+    }
+  }
 
   const instructions = `You are an Amazon Marketplace Listing Expert.
 
@@ -83,7 +98,9 @@ Return ONLY these sections (A–D), plain text.`;
 ${uspLine}
 Marketplace: ${marketplace}
 ${brandVoiceLine}
-User product info: ${userPrompt}
+
+User product info:
+${userPrompt}
 
 Generate ${variants === 3 ? "THREE distinct variants (A/B/C)" : "ONE version"}.
 Each variant must fully include A–D.
@@ -107,7 +124,7 @@ VARIANT C`;
     const v1 = validateOutput(output, { BULLET_COUNT, BULLET_MIN, BULLET_MAX, DESC_MIN, DESC_MAX });
     if (v1.ok) return json({ output }, 200);
 
-    // 3) Repair pass (rewrite A–D to satisfy HARD requirements)
+    // 3) Repair pass
     const repairInstructions = `${instructions}
 You MUST fix the output to satisfy the HARD REQUIREMENTS.
 Return again ONLY A–D.
@@ -132,10 +149,9 @@ Rewrite the output to satisfy the constraints.`;
     const v2 = validateOutput(output, { BULLET_COUNT, BULLET_MIN, BULLET_MAX, DESC_MIN, DESC_MAX });
     if (v2.ok) return json({ output }, 200);
 
-    // Targeted description fix (only if description is the remaining issue)
     const parsed = parseAD(output);
     if (!parsed.desc) {
-      return json({ output }, 200); // cannot parse; return best effort
+      return json({ output }, 200);
     }
 
     const descLen = normalizeSpaces(parsed.desc).length;
@@ -169,13 +185,305 @@ Rewrite the output to satisfy the constraints.`;
   }
 }
 
+/* ---------------- URL SCRAPE / EXTRACT ---------------- */
+
+function looksLikeUrl(s) {
+  return /^https?:\/\/\S+$/i.test(String(s || "").trim());
+}
+
+function isPrivateOrLocalHost(hostname) {
+  const h = String(hostname || "").trim().toLowerCase();
+  if (!h) return true;
+  if (h === "localhost" || h.endsWith(".local")) return true;
+
+  // Block plain IPv4 private ranges
+  const ipv4 = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (ipv4) {
+    const a = Number(ipv4[1]), b = Number(ipv4[2]);
+    if (a === 10) return true;
+    if (a === 127) return true;
+    if (a === 169 && b === 254) return true;
+    if (a === 192 && b === 168) return true;
+    if (a === 172 && b >= 16 && b <= 31) return true;
+  }
+
+  // Basic IPv6 localhost
+  if (h === "::1") return true;
+
+  return false;
+}
+
+async function fetchProductContext(url, { timeoutMs = 15000 } = {}) {
+  let u;
+  try {
+    u = new URL(url);
+  } catch {
+    throw new Error("Invalid URL");
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") throw new Error("Unsupported URL protocol");
+  if (isPrivateOrLocalHost(u.hostname)) throw new Error("Blocked host");
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  const resp = await fetch(url, {
+    method: "GET",
+    signal: controller.signal,
+    headers: {
+      // леко помага срещу някои блокировки
+      "User-Agent": "Mozilla/5.0 (compatible; ListingBot/1.0)",
+      "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    },
+  }).finally(() => clearTimeout(timeout));
+
+  const contentType = (resp.headers.get("content-type") || "").toLowerCase();
+  const html = await resp.text();
+
+  const pageTitle = extractTagText(html, "title");
+  const metaDescription = extractMetaContent(html, "description");
+  const h1 = extractFirstH1(html);
+
+  const jsonLdBlocks = extractJsonLdBlocks(html);
+  const productLd = findFirstProductJsonLd(jsonLdBlocks);
+
+  // Fallback: cleaned visible text (truncated)
+  const cleanedText = cleanHtmlToText(html);
+
+  return {
+    source_url: url,
+    status: resp.status,
+    content_type: contentType,
+    page_title: pageTitle,
+    meta_description: metaDescription,
+    h1,
+    product_jsonld: productLd,
+    extracted_text: cleanedText,
+  };
+}
+
+function buildProductContextText(ctx) {
+  const lines = [];
+  lines.push(`SOURCE URL: ${ctx.source_url}`);
+  if (ctx.status) lines.push(`HTTP STATUS: ${ctx.status}`);
+  if (ctx.page_title) lines.push(`PAGE TITLE: ${ctx.page_title}`);
+  if (ctx.h1) lines.push(`H1: ${ctx.h1}`);
+  if (ctx.meta_description) lines.push(`META DESCRIPTION: ${ctx.meta_description}`);
+
+  if (ctx.product_jsonld) {
+    const p = ctx.product_jsonld;
+    lines.push("");
+    lines.push("STRUCTURED PRODUCT DATA (JSON-LD):");
+    if (p.name) lines.push(`Name: ${p.name}`);
+    if (p.brand) lines.push(`Brand: ${p.brand}`);
+    if (p.sku) lines.push(`SKU: ${p.sku}`);
+    if (p.gtin) lines.push(`GTIN: ${p.gtin}`);
+    if (p.mpn) lines.push(`MPN: ${p.mpn}`);
+    if (p.category) lines.push(`Category: ${p.category}`);
+    if (p.description) lines.push(`Description: ${p.description}`);
+    if (p.price || p.currency) lines.push(`Price: ${p.price || ""} ${p.currency || ""}`.trim());
+    if (p.availability) lines.push(`Availability: ${p.availability}`);
+    if (p.url) lines.push(`Offer URL: ${p.url}`);
+    if (Array.isArray(p.images) && p.images.length) lines.push(`Images: ${p.images.slice(0, 5).join(" | ")}`);
+  }
+
+  if (ctx.extracted_text) {
+    lines.push("");
+    lines.push("EXTRACTED PAGE TEXT (cleaned):");
+    lines.push(truncate(ctx.extracted_text, 9000));
+  }
+
+  const out = lines.join("\n").trim();
+  return truncate(out, 12000);
+}
+
+function extractTagText(html, tag) {
+  const re = new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i");
+  const m = String(html || "").match(re);
+  if (!m) return "";
+  return normalizeSpaces(decodeHtmlEntities(stripTags(m[1])));
+}
+
+function extractFirstH1(html) {
+  const re = /<h1[^>]*>([\s\S]*?)<\/h1>/i;
+  const m = String(html || "").match(re);
+  if (!m) return "";
+  return normalizeSpaces(decodeHtmlEntities(stripTags(m[1])));
+}
+
+function extractMetaContent(html, name) {
+  const s = String(html || "");
+  // meta name="description" content="..."
+  const re1 = new RegExp(`<meta[^>]+name=["']${escapeRegExp(name)}["'][^>]*>`, "i");
+  const tag = (s.match(re1) || [])[0] || "";
+  if (!tag) return "";
+  const m = tag.match(/content=["']([^"']+)["']/i);
+  return m ? normalizeSpaces(decodeHtmlEntities(m[1])) : "";
+}
+
+function extractJsonLdBlocks(html) {
+  const s = String(html || "");
+  const re = /<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  const out = [];
+  let m;
+  while ((m = re.exec(s)) !== null) {
+    const raw = String(m[1] || "").trim();
+    if (!raw) continue;
+    const cleaned = raw.replace(/^\s*<!--/, "").replace(/-->\s*$/, "").trim();
+    try {
+      out.push(JSON.parse(cleaned));
+    } catch {
+      // Some sites put multiple JSON objects or invalid JSON; ignore silently
+    }
+  }
+  return out;
+}
+
+function findFirstProductJsonLd(blocks) {
+  const candidates = [];
+
+  for (const b of blocks || []) {
+    collectJsonLdNodes(b, candidates);
+  }
+
+  // find first Product
+  for (const node of candidates) {
+    const t = String(node?.["@type"] || "").toLowerCase();
+    if (t === "product" || (Array.isArray(node?.["@type"]) && node["@type"].some(x => String(x).toLowerCase() === "product"))) {
+      return normalizeProductLd(node);
+    }
+  }
+  return null;
+}
+
+function collectJsonLdNodes(node, out) {
+  if (!node) return;
+
+  if (Array.isArray(node)) {
+    for (const x of node) collectJsonLdNodes(x, out);
+    return;
+  }
+
+  if (typeof node === "object") {
+    out.push(node);
+    if (node["@graph"]) collectJsonLdNodes(node["@graph"], out);
+    // also scan nested objects lightly
+    for (const k of Object.keys(node)) {
+      const v = node[k];
+      if (v && typeof v === "object") collectJsonLdNodes(v, out);
+    }
+  }
+}
+
+function normalizeProductLd(p) {
+  const brand = p?.brand?.name || p?.brand || "";
+  const offers = Array.isArray(p?.offers) ? p.offers[0] : p?.offers;
+  const availability = offers?.availability || "";
+  const price = offers?.price || offers?.lowPrice || "";
+  const currency = offers?.priceCurrency || "";
+  const offerUrl = offers?.url || "";
+
+  // common GTIN fields
+  const gtin = p?.gtin13 || p?.gtin12 || p?.gtin14 || p?.gtin8 || p?.gtin || "";
+
+  const images = [];
+  const img = p?.image;
+  if (typeof img === "string") images.push(img);
+  else if (Array.isArray(img)) images.push(...img.filter(x => typeof x === "string"));
+
+  return {
+    name: normalizeSpaces(decodeHtmlEntities(String(p?.name || ""))),
+    description: normalizeSpaces(decodeHtmlEntities(stripTags(String(p?.description || "")))),
+    brand: normalizeSpaces(decodeHtmlEntities(String(brand || ""))),
+    sku: normalizeSpaces(String(p?.sku || "")),
+    mpn: normalizeSpaces(String(p?.mpn || "")),
+    gtin: normalizeSpaces(String(gtin || "")),
+    category: normalizeSpaces(decodeHtmlEntities(String(p?.category || ""))),
+    price: normalizeSpaces(String(price || "")),
+    currency: normalizeSpaces(String(currency || "")),
+    availability: normalizeSpaces(String(availability || "")),
+    url: normalizeSpaces(String(offerUrl || "")),
+    images: images.map(x => String(x)).filter(Boolean),
+  };
+}
+
+function cleanHtmlToText(html) {
+  let s = String(html || "");
+
+  // remove scripts/styles/noscript
+  s = s.replace(/<script[\s\S]*?<\/script>/gi, " ");
+  s = s.replace(/<style[\s\S]*?<\/style>/gi, " ");
+  s = s.replace(/<noscript[\s\S]*?<\/noscript>/gi, " ");
+
+  // drop svg (often huge)
+  s = s.replace(/<svg[\s\S]*?<\/svg>/gi, " ");
+
+  // keep separators
+  s = s.replace(/<\/(p|div|li|br|h1|h2|h3|h4|h5|h6|tr|td|th)>/gi, "\n");
+
+  // strip remaining tags
+  s = stripTags(s);
+
+  // decode entities + normalize spaces
+  s = decodeHtmlEntities(s);
+  s = s.replace(/[ \t]+\n/g, "\n");
+  s = s.replace(/\n{3,}/g, "\n\n");
+  s = s.replace(/[ \t]{2,}/g, " ");
+
+  return normalizeSpaces(s).slice(0, 20000);
+}
+
+function stripTags(s) {
+  return String(s || "").replace(/<[^>]+>/g, " ");
+}
+
+function decodeHtmlEntities(s) {
+  let out = String(s || "");
+
+  const map = {
+    "&amp;": "&",
+    "&lt;": "<",
+    "&gt;": ">",
+    "&quot;": '"',
+    "&#34;": '"',
+    "&#39;": "'",
+    "&apos;": "'",
+    "&nbsp;": " ",
+  };
+
+  out = out.replace(/&(amp|lt|gt|quot|apos|nbsp);/g, (m) => map[m] || m);
+  out = out.replace(/&#(\d+);/g, (_, d) => {
+    const code = Number(d);
+    if (!Number.isFinite(code)) return _;
+    try { return String.fromCharCode(code); } catch { return _; }
+  });
+  out = out.replace(/&#x([0-9a-f]+);/gi, (_, h) => {
+    const code = parseInt(h, 16);
+    if (!Number.isFinite(code)) return _;
+    try { return String.fromCharCode(code); } catch { return _; }
+  });
+
+  // handle any remaining common mapped ones
+  for (const [k, v] of Object.entries(map)) {
+    out = out.split(k).join(v);
+  }
+  return out;
+}
+
+function truncate(s, maxLen) {
+  const str = String(s || "");
+  if (str.length <= maxLen) return str;
+  return str.slice(0, maxLen - 20).trimEnd() + "\n...[TRUNCATED]...";
+}
+
+function escapeRegExp(s) {
+  return String(s || "").replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 /* ---------------- VALIDATION ---------------- */
 function validateOutput(text, cfg) {
   const errors = [];
 
-  // if variants exist, validate each variant block
   const variants = splitVariants(text);
-
   for (const v of variants) {
     const block = v.text || "";
     const p = parseAD(block);
@@ -227,8 +535,6 @@ function splitVariants(text) {
 
 function parseAD(text) {
   const t = String(text || "");
-
-  // tolerant markers (allow missing colon, different spacing)
   const title = extractBetweenAny(t, [/A\)\s*TITLE\s*:/i, /A\)\s*TITLE\s*/i], [/B\)\s*BULLET/i]);
   const bullets = extractBetweenAny(
     t,
@@ -309,13 +615,10 @@ function extractAfterAny(text, startPatterns) {
 }
 
 function splitBullets(block) {
-  const lines = String(block || "")
+  return String(block || "")
     .split("\n")
     .map((l) => l.trim())
     .filter(Boolean);
-
-  // allow bullets separated by newline only
-  return lines;
 }
 
 function normalizeSpaces(s) {
@@ -363,7 +666,6 @@ Rewrite the description to meet the length requirement exactly within range.`;
 /* ---------------- OpenAI call helper ---------------- */
 function modelSupportsTemperature(modelId) {
   const m = String(modelId || "").trim().toLowerCase();
-  // Reasoning models reject sampling params like temperature
   if (m.startsWith("gpt-5")) return false;
   if (/^o\d/.test(m)) return false; // o1, o3, o4, etc.
   return true;
@@ -383,7 +685,7 @@ async function callOpenAI(env, instructions, input, { max_output_tokens, tempera
     text: { format: { type: "text" } },
   };
 
-  // ✅ FIX: only send temperature if the selected model supports it
+  // ✅ FIX: only send temperature if supported by model
   if (modelSupportsTemperature(model) && typeof temperature === "number") {
     payload.temperature = temperature;
   }

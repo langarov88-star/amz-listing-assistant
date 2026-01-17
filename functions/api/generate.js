@@ -49,6 +49,8 @@ export async function onRequestPost(context) {
   // ---- System instructions ----
   const instructions = `You are an Amazon Marketplace Listing Expert.
 
+const instructions = `You are an Amazon Marketplace Listing Expert.
+
 GOAL:
 Create HIGH-CONVERTING, Amazon-optimized listings that comply with Amazon policies.
 
@@ -66,6 +68,13 @@ BULLET RULES:
 - Short, scannable
 - Keyword → micro-benefit
 - No fluff
+
+DESCRIPTION RULES:
+- Total length must be 3000–4000 characters (including spaces)
+- Use structured subheadings where helpful
+- Natural keyword integration (no stuffing)
+- No prohibited claims (medical/guarantees), comply with Amazon policies
+- Must be coherent, conversion-oriented, and readable
 
 BACKEND SEARCH TERMS:
 - ~250 characters

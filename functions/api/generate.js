@@ -361,9 +361,32 @@ Rewrite the description to meet the length requirement exactly within range.`;
 }
 
 /* ---------------- OpenAI call helper ---------------- */
+function modelSupportsTemperature(modelId) {
+  const m = String(modelId || "").trim().toLowerCase();
+  // Reasoning models reject sampling params like temperature
+  if (m.startsWith("gpt-5")) return false;
+  if (/^o\d/.test(m)) return false; // o1, o3, o4, etc.
+  return true;
+}
+
 async function callOpenAI(env, instructions, input, { max_output_tokens, temperature, timeoutMs }) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs || 60000);
+
+  const model = env.OPENAI_MODEL || "gpt-5.2";
+
+  const payload = {
+    model,
+    instructions,
+    input,
+    max_output_tokens: max_output_tokens ?? 3200,
+    text: { format: { type: "text" } },
+  };
+
+  // ✅ FIX: only send temperature if the selected model supports it
+  if (modelSupportsTemperature(model) && typeof temperature === "number") {
+    payload.temperature = temperature;
+  }
 
   const resp = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -372,14 +395,7 @@ async function callOpenAI(env, instructions, input, { max_output_tokens, tempera
       Authorization: `Bearer ${env.OPENAI_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      model: env.OPENAI_MODEL || "gpt-5.2",
-      instructions,
-      input,
-      max_output_tokens: max_output_tokens ?? 3200,
-      temperature: temperature ?? 0.7,
-      text: { format: { type: "text" } },
-    }),
+    body: JSON.stringify(payload),
   }).finally(() => clearTimeout(timeout));
 
   const contentType = resp.headers.get("content-type") || "";

@@ -72,7 +72,7 @@ HARD REQUIREMENTS (must be satisfied):
 
 TITLE RULES:
 - Title MUST follow this exact structure:
-  BRAND PRODUCT_LINE PRODUCT_TYPE for AREA + MAIN NEED, with ACTIVE_1 & ACTIVE_2, VOLUME ml, SKIN_TYPE, KEY BENEFIT
+  BRAND PRODUCT_LINE PRODUCT_TYPE VOLUME ml for AREA + MAIN NEED, with ACTIVE_1 & ACTIVE_2, SKIN_TYPE, KEY BENEFIT
 - Use the en dash "–" and the separators "+" and "|" and parentheses "()" exactly as shown.
 - Keep it clear and readable (no keyword stuffing).
 - Aim ~185–200 characters total.

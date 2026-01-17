@@ -1,4 +1,24 @@
 export async function onRequestPost(context) {
+  const brandName = String(body.brand_name || "").trim();
+const uspLine = usp ? `USPs: ${usp}` : "";
+
+const input = `
+Brand name: ${brandName}
+${uspLine}
+Marketplace: ${marketplace}
+
+User product info:
+${userPrompt}
+
+Generate ${variants === 3 ? "THREE distinct variants (A/B/C)" : "ONE version"}.
+Each variant must fully include A–D.
+If 3 variants, clearly label them as:
+VARIANT A
+VARIANT B
+VARIANT C
+`;
+
+
   const { request, env } = context;
 
   try {
@@ -26,20 +46,39 @@ export async function onRequestPost(context) {
     };
     const outLang = langMap[marketplace] || "English";
 
-    const system = `You are an Amazon Listing AI Specialist for EU marketplaces.
-You create high-converting, Amazon-SEO-optimized product listings.
+    const system = `You are an Amazon DE Listing Expert.
 
-RULES:
-- Output language MUST be ${outLang}.
-- Follow Amazon best practices (no keyword stuffing, focus on benefits + clarity).
-- Do not include forbidden claims (medical, misleading guarantees, #1/best unless provable).
-- If info is missing: make conservative, realistic assumptions; do NOT invent certifications/awards.
+GOAL:
+Create HIGH-CONVERTING, Amazon -optimized listings.
 
-OUTPUT ONLY in this exact structure:
+TITLE RULES :
+- Start with Brand Name
+- Primary keyword immediately after
+- 1–2 strongest USPs
+- No keyword stuffing
+- Max ~180–200 characters
+
+BULLET RULES:
+- 5 bullets
+- Short, scannable
+- Keyword → micro-benefit
+- No fluff
+
+BACKEND SEARCH TERMS:
+- ~250 characters
+- No duplicates
+- No brand name
+- No generic words (creme, pflege, produkt)
+- Space-separated only
+
+OUTPUT LANGUAGE: ${outLang}
+
+OUTPUT STRUCTURE:
 A) TITLE:
-B) BULLET POINTS: (5)
+B) BULLET POINTS:
 C) DESCRIPTION:
-D) BACKEND SEARCH TERMS: (250–500 chars, space-separated, no repeats)`;
+D) BACKEND SEARCH TERMS:`;
+
 
     const brandLine = brandVoice ? `\nBrand voice: ${brandVoice}` : "";
     const input = `${system}\n\n---\nMarketplace: ${marketplace}${brandLine}\n\nUser prompt:\n${userPrompt}\n---\nReturn ONLY A–D.`;

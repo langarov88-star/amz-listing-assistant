@@ -1,9 +1,14 @@
 export async function onRequestPost({ request, env }) {
-  if (!env?.OPENAI_API_KEY) return json({ error: "OPENAI_API_KEY missing in runtime env" }, 500);
+  if (!env?.OPENAI_API_KEY) {
+    return json({ error: "OPENAI_API_KEY missing in runtime env" }, 500);
+  }
 
   let body;
-  try { body = await request.json(); }
-  catch { return json({ error: "Invalid JSON body" }, 400); }
+  try {
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
 
   const marketplace = String(body.marketplace || "").trim();
   const brandVoice = String(body.brand_voice || "").trim();
@@ -30,251 +35,335 @@ export async function onRequestPost({ request, env }) {
   };
   const outLang = langMap[marketplace] || "English";
 
-  const CFG = {
-    TITLE_MIN: 180,
-    TITLE_MAX: 195,
-    TITLE_HARD_MAX: 200,
-    BULLET_COUNT: 5,
-    BULLET_MIN: 220,
-    BULLET_MAX: 240,
-    DESC_MIN: 3300,
-    DESC_MAX: 3700,
-    BACKEND_MAX_BYTES: 250,
-  };
+  // ✅ ТУК: булети + описание с твърди изисквания
+  const BULLET_COUNT = 7;
+  const BULLET_MIN = 220; // chars
+  const BULLET_MAX = 240; // chars
+  const DESC_MIN = 3000; // chars
+  const DESC_MAX = 4000; // chars
 
-  const model = env.OPENAI_MODEL || "gpt-5.2-mini"; // по-бързо; override с env ако искаш gpt-5.2
+  const instructions = `You are an Amazon Marketplace Listing Expert.
 
-  const baseContext = `Brand name: ${brandName}
+OUTPUT LANGUAGE: ${outLang}
+
+HARD REQUIREMENTS (must be satisfied):
+- Bullet points: EXACTLY ${BULLET_COUNT} bullets.
+- Each bullet MUST be ${BULLET_MIN}–${BULLET_MAX} characters (including spaces).
+- Each bullet must start with: an emoji + a SHORT UPPERCASE label + colon, then the text.
+  Example format: "✅ HEAT PROTECTION: ..."
+- Description: MUST be ${DESC_MIN}–${DESC_MAX} characters total (including spaces).
+- Description must be detailed, multi-paragraph, conversion-oriented, readable.
+- No medical claims, no guarantees, comply with Amazon policies.
+
+TITLE RULES:
+- Title MUST follow this exact structure:
+  BRAND – Haupt-Keyword + Produkttyp [VOLUMEN ml] – Relevante Terme | Hauttyp/Ziel | Einzigartiger Vorteil
+- Use the en dash "–" and the separators "+" "[" "]" and "|" exactly as shown.
+- Keep it clear and readable (no keyword stuffing).
+- Aim ~185–200 characters total.
+
+BACKEND SEARCH TERMS:
+- ~250 characters
+- No duplicates
+- No brand name
+- Space-separated only (no commas)
+
+OUTPUT STRUCTURE (for each variant):
+A) TITLE:
+B) BULLET POINTS:
+C) DESCRIPTION:
+D) BACKEND SEARCH TERMS:
+
+Return ONLY these sections (A–D), plain text.`;
+
+  const uspLine = usp ? `USPs: ${usp}` : "";
+  const brandVoiceLine = brandVoice ? `Brand voice: ${brandVoice}` : "";
+
+  const input = `Brand name: ${brandName}
+${uspLine}
 Marketplace: ${marketplace}
-Output language for client fields: ${outLang}
-${usp ? `USPs: ${usp}` : ""}
-${brandVoice ? `Brand voice: ${brandVoice}` : ""}
+${brandVoiceLine}
+User product info: ${userPrompt}
 
-User product info (may include label/INCI):
-${userPrompt}`.trim();
+Generate ${variants === 3 ? "THREE distinct variants (A/B/C)" : "ONE version"}.
+Each variant must fully include A–D.
+If 3 variants, clearly label them exactly as:
+VARIANT A
+VARIANT B
+VARIANT C`;
 
-  // ---------------- Phase 1: fast web research (short) ----------------
-  let phase1 = "";
   try {
-    const phase1Instructions = buildPhase1Instructions({ marketplace, outLang });
-    const phase1Resp = await callOpenAI(env, {
-      model,
-      instructions: phase1Instructions,
-      input: baseContext,
-      max_output_tokens: 1200,
-      timeoutMs: 65000,
-      tools: [{ type: "web_search" }],
-      include: ["web_search_call.action.sources"],
-      reasoning: { effort: "low" },
-      verbosity: "low",
+    // 1) First pass
+    const first = await callOpenAI(env, instructions, input, {
+      max_output_tokens: variants === 3 ? 7500 : 3200,
+      temperature: 0.7,
+      timeoutMs: 60000,
     });
 
-    phase1 = extractText(phase1Resp);
-    // ако model не е сложил линкове, добавяме от tool sources
-    phase1 = ensurePhase1Sources(phase1, extractWebSources(phase1Resp));
-  } catch (e) {
-    // fallback (без web, без чупене)
-    phase1 =
-      "ФАЗА 1 · РЕСЪРЧ (резюме)\n" +
-      "• Топ ключови думи : (fallback) feuchtigkeit serum creme sensitive haut anti frizz scalp\n" +
-      "• Title шаблони (3–5): BRAND – Produkt [VOLUMEN] | Key Ingredient | Nutzen | Differenziator\n" +
-      "• Повтарящи ползи (5–7): Feuchtigkeit, geschmeidiges Gefühl, Glanz, beruhigendes Hautgefühl, Schutz vor Austrocknung, einfache Anwendung, angenehme Textur\n" +
-      "• Диференциатори (3–5): milde Formel, für Alltag geeignet, schnelle Absorption, ohne klebriges Gefühl, klare Anwendung\n" +
-      "• Източници: [https://www.amazon.de/]\n";
-  }
+    let output = extractText(first);
+    if (!output) return json({ error: "Empty output from OpenAI", debug: first }, 500);
 
-  // ---------------- Phase 2: listing (no web_search to avoid timeouts) ----------------
-  const phase2Instructions = buildPhase2Instructions({ marketplace, outLang, brandName, cfg: CFG, variants });
+    // 2) Validate
+    const v1 = validateOutput(output, { BULLET_COUNT, BULLET_MIN, BULLET_MAX, DESC_MIN, DESC_MAX });
+    if (v1.ok) return json({ output }, 200);
 
-  let phase2 = "";
-  try {
-    const phase2Resp = await callOpenAI(env, {
-      model,
-      instructions: phase2Instructions,
-      input: `${baseContext}\n\nResearch summary (use for keywords/themes):\n${phase1}`,
-      max_output_tokens: variants === 3 ? 5200 : 2600,
-      timeoutMs: variants === 3 ? 120000 : 95000,
-      reasoning: { effort: "low" },
-      verbosity: "medium",
-    });
+    // 3) Repair pass (rewrite A–D to satisfy HARD requirements)
+    const repairInstructions = `${instructions}
+You MUST fix the output to satisfy the HARD REQUIREMENTS.
+Return again ONLY A–D.
+Do not add extra commentary.`;
 
-    phase2 = extractText(phase2Resp);
-  } catch (e) {
-    const msg = e?.name === "AbortError" ? "Timeout while calling OpenAI. Try again." : String(e?.message || e);
-    return json({ error: msg }, 500);
-  }
+    const repairInput = `${input}
 
-  // Build full output
-  let output = `${phase1.trim()}\n\n${phase2.trim()}`.trim();
-
-  // Safety: remove any URLs after Phase 2 (only Phase 1 sources line can have URLs)
-  output = stripUrlsInPhase2(output);
-
-  // Post-process backend to ASCII + refresh counters
-  output = postProcessCountersAndBackend(output, { brandName, cfg: CFG });
-
-  // Validate; if fails -> one repair pass (Phase 2 only)
-  const v1 = validatePhase2(output, { brandName, cfg: CFG, variants });
-  if (!v1.ok) {
-    try {
-      const repairInstructions = buildRepairInstructions({ marketplace, outLang, brandName, cfg: CFG, variants });
-      const repairResp = await callOpenAI(env, {
-        model,
-        instructions: repairInstructions,
-        input: `${baseContext}
-
-Research summary:
-${phase1}
-
-CURRENT OUTPUT (violations):
+CURRENT OUTPUT (violations found):
 ${v1.errors.join("\n")}
 
-Rewrite ONLY "ФАЗА 2 · ЛИСТИНГ" to satisfy all constraints.`,
-        max_output_tokens: variants === 3 ? 5600 : 2800,
-        timeoutMs: variants === 3 ? 120000 : 95000,
-        reasoning: { effort: "low" },
-        verbosity: "medium",
-      });
+Rewrite the output to satisfy the constraints.`;
 
-      const repairedPhase2 = extractText(repairResp);
-      if (repairedPhase2) {
-        output = `${phase1.trim()}\n\n${repairedPhase2.trim()}`.trim();
-        output = stripUrlsInPhase2(output);
-        output = postProcessCountersAndBackend(output, { brandName, cfg: CFG });
+    const repaired = await callOpenAI(env, repairInstructions, repairInput, {
+      max_output_tokens: variants === 3 ? 8500 : 3600,
+      temperature: 0.65,
+      timeoutMs: 60000,
+    });
+
+    output = extractText(repaired) || output;
+
+    // 4) Validate again; if still not ok → try targeted description fix once
+    const v2 = validateOutput(output, { BULLET_COUNT, BULLET_MIN, BULLET_MAX, DESC_MIN, DESC_MAX });
+    if (v2.ok) return json({ output }, 200);
+
+    // Targeted description fix (only if description is the remaining issue)
+    const parsed = parseAD(output);
+    if (!parsed.desc) {
+      return json({ output }, 200); // cannot parse; return best effort
+    }
+
+    const descLen = normalizeSpaces(parsed.desc).length;
+    const descBad = descLen < DESC_MIN || descLen > DESC_MAX;
+
+    if (descBad) {
+      const fixedDesc = await fixDescriptionOnly(env, {
+        outLang,
+        marketplace,
+        brandName,
+        usp,
+        brandVoice,
+        userPrompt,
+        DESC_MIN,
+        DESC_MAX,
+        currentDesc: parsed.desc,
+      });
+      if (fixedDesc) {
+        parsed.desc = fixedDesc;
+        output = rebuildAD(parsed);
       }
-    } catch {
-      // return best effort output
+    }
+
+    return json({ output }, 200);
+  } catch (e) {
+    const msg =
+      e?.name === "AbortError"
+        ? "Timeout while calling OpenAI. Try again."
+        : String(e?.message || e || "Server error");
+    return json({ error: msg }, 500);
+  }
+}
+
+/* ---------------- VALIDATION ---------------- */
+function validateOutput(text, cfg) {
+  const errors = [];
+
+  // if variants exist, validate each variant block
+  const variants = splitVariants(text);
+
+  for (const v of variants) {
+    const block = v.text || "";
+    const p = parseAD(block);
+    const bullets = splitBullets(p.bullets);
+
+    if (bullets.length !== cfg.BULLET_COUNT) {
+      errors.push(`${v.label || "OUTPUT"}: bullets count = ${bullets.length}, expected ${cfg.BULLET_COUNT}`);
+    } else {
+      bullets.forEach((b, i) => {
+        const len = normalizeSpaces(b).length;
+        if (len < cfg.BULLET_MIN || len > cfg.BULLET_MAX) {
+          errors.push(
+            `${v.label || "OUTPUT"}: bullet ${i + 1} length = ${len}, expected ${cfg.BULLET_MIN}-${cfg.BULLET_MAX}`
+          );
+        }
+      });
+    }
+
+    const descLen = normalizeSpaces(p.desc).length;
+    if (descLen < cfg.DESC_MIN || descLen > cfg.DESC_MAX) {
+      errors.push(`${v.label || "OUTPUT"}: description length = ${descLen}, expected ${cfg.DESC_MIN}-${cfg.DESC_MAX}`);
     }
   }
 
-  return json({ output }, 200);
+  return { ok: errors.length === 0, errors };
 }
 
-/* ---------------- PROMPTS (SHORT) ---------------- */
+/* ---------------- PARSING / REBUILD ---------------- */
+function splitVariants(text) {
+  const s = String(text || "").trim();
+  const re = /\bVARIANT\s+[ABC]\b/gi;
 
-function buildPhase1Instructions({ marketplace, outLang }) {
-  return `You are an Amazon EU listing researcher. Use web_search.
-Goal: short competitor scan for ${marketplace}.
+  const matches = [];
+  let m;
+  while ((m = re.exec(s)) !== null) matches.push({ idx: m.index, label: m[0].toUpperCase() });
 
-Output ONLY:
-ФАЗА 1 · РЕСЪРЧ (резюме)
-• Топ ключови думи : (comma-separated)
-• Title шаблони (3–5): (short patterns)
-• Повтарящи ползи (5–7): (short phrases)
-• Диференциатори (3–5): (short phrases)
-• Източници: [URL] [URL] ... (links ONLY here)
+  if (!matches.length) return [{ label: "", text: s }];
 
-Rules:
-- Keep it brief (no long paragraphs).
-- Sources must be real URLs.
-- Do NOT include any URLs outside the Sources line.
-- Language of bullets can be Bulgarian; keywords can be ${outLang}.`;
+  const out = [];
+  for (let i = 0; i < matches.length; i++) {
+    const start = matches[i].idx;
+    const end = i + 1 < matches.length ? matches[i + 1].idx : s.length;
+    const chunk = s.slice(start, end).trim();
+    const firstLine = chunk.split("\n")[0].trim();
+    out.push({ label: firstLine, text: chunk.slice(firstLine.length).trim() });
+  }
+  return out;
 }
 
-function buildPhase2Instructions({ marketplace, outLang, brandName, cfg, variants }) {
-  return `You are an Amazon Listing Assistant for EU sellers. Focus on ${marketplace}.
-Create copy-ready listing with STRICT limits.
+function parseAD(text) {
+  const t = String(text || "");
 
-COMPLIANCE:
-- No medical/healing claims. No guarantees. No "klinisch bewiesen/dermatologisch getestet" unless provided.
-- No competitor brands. No URLs in Phase 2.
+  // tolerant markers (allow missing colon, different spacing)
+  const title = extractBetweenAny(t, [/A\)\s*TITLE\s*:/i, /A\)\s*TITLE\s*/i], [/B\)\s*BULLET/i]);
+  const bullets = extractBetweenAny(
+    t,
+    [/B\)\s*BULLET[\s-]*POINTS\s*:/i, /B\)\s*BULLET[\s-]*POINTS/i],
+    [/C\)\s*DESCRIPTION/i]
+  );
+  const desc = extractBetweenAny(t, [/C\)\s*DESCRIPTION\s*:/i, /C\)\s*DESCRIPTION/i], [/D\)\s*BACKEND/i]);
+  const backend = extractAfterAny(
+    t,
+    [/D\)\s*BACKEND[\s-]*SEARCH\s*TERMS\s*:/i, /D\)\s*BACKEND[\s-]*SEARCH\s*TERMS/i]
+  );
 
-LOCALIZATION:
-- Client fields in ${outLang}. No Cyrillic in client fields.
-- For DE: capitalize nouns; space before units (50 ml).
-
-HARD LIMITS:
-- Exactly 2 Titles. Each ${cfg.TITLE_MIN}-${cfg.TITLE_MAX} chars (hard ≤${cfg.TITLE_HARD_MAX}). Must start with "${brandName}". Show "(Chars: X)".
-- Exactly ${cfg.BULLET_COUNT} bullets. Each ${cfg.BULLET_MIN}-${cfg.BULLET_MAX} chars. One line each. Format: "• **Label**: text". Label NOT ALL CAPS. No emojis.
-- Description length ${cfg.DESC_MIN}-${cfg.DESC_MAX} chars. Multi-paragraph, mobile readable. Show "Product Description (Chars: Z)".
-- Backend: ONE line, space-separated, ASCII only (ä->ae ö->oe ü->ue ß->ss), no brand name, ≤${cfg.BACKEND_MAX_BYTES} bytes. Show "(Bytes: Y)".
-- Active Ingredients: INCI 1:1 from user label if provided; else "Not provided".
-
-OUTPUT FORMAT EXACTLY:
-ФАЗА 2 · ЛИСТИНГ
-${variants === 3 ? "VARIANT A\n...\nVARIANT B\n...\nVARIANT C\n..." : ""}
-
-Phase 2 block:
-Titles (2 варианта):
-1. ... (Chars: X)
-2. ... (Chars: Y)
-Bullet Points (5):
-• **...**: ...
-• **...**: ...
-• **...**: ...
-• **...**: ...
-• **...**: ...
-Product Description (Chars: Z)
-<text>
-Backend — Generic Keywords (1 ред) (Bytes: Y):
-<one line>
-Active Ingredients (черта със запетайки):
-<INCI or Not provided>
-Compliance note (ако е нужно): ...
-• Special Features – 1 ред
-• Benefits – 3 на брой
-• Special Ingredients – търговските наименования
-• Material Features – 1 ред
-• Material Type Free – 1 ред
-• Active Ingredients – търговски наименования
-• Recommended Uses For Product – 1 изречение
-• Scent – 1 ред
-• Safety Warning – 1 ред
-• Directions – 1 ред
-Attributes (препоръка за попълване):
-• Size: ...
-• Skin type: ...
-• Benefits: ...
-• Recommended use: ...
-QA & Compliance Check:
-• ✅/⚠️ Title length
-• ✅/⚠️ Bullets count/length/format
-• ✅/⚠️ Description length
-• ✅/⚠️ Backend bytes/ASCII/no brand
-• ✅/⚠️ No URLs in Phase 2
-• ✅/⚠️ No emojis/No Cyrillic in client fields
-
-If info missing: add ONE line at the start of Phase 2: "Assumptions: ...".`;
+  return {
+    title: title.trim(),
+    bullets: bullets.trim(),
+    desc: desc.trim(),
+    backend: backend.trim(),
+  };
 }
 
-function buildRepairInstructions({ marketplace, outLang, brandName, cfg, variants }) {
-  return `You are fixing an Amazon listing. Focus on ${marketplace}.
-Rewrite ONLY Phase 2 to satisfy constraints EXACTLY. No extra commentary.
-
-Same constraints:
-- Titles: 2, each ${cfg.TITLE_MIN}-${cfg.TITLE_MAX} chars (≤${cfg.TITLE_HARD_MAX}), start with "${brandName}", show (Chars: X)
-- Bullets: ${cfg.BULLET_COUNT}, each ${cfg.BULLET_MIN}-${cfg.BULLET_MAX} chars, one line, format "• **Label**: ...", label not ALL CAPS, no emojis
-- Description: ${cfg.DESC_MIN}-${cfg.DESC_MAX} chars, show (Chars: Z)
-- Backend: one line, ASCII only, ≤${cfg.BACKEND_MAX_BYTES} bytes, no brand, show (Bytes: Y)
-- No URLs anywhere in Phase 2
-- Client fields in ${outLang}, no Cyrillic
-
-Output:
-ФАЗА 2 · ЛИСТИНГ
-${variants === 3 ? "VARIANT A / VARIANT B / VARIANT C blocks" : "single block"}
-(with the exact block structure).`;
+function rebuildAD(p) {
+  return [
+    "A) TITLE:",
+    (p.title || "").trim(),
+    "",
+    "B) BULLET POINTS:",
+    (p.bullets || "").trim(),
+    "",
+    "C) DESCRIPTION:",
+    (p.desc || "").trim(),
+    "",
+    "D) BACKEND SEARCH TERMS:",
+    (p.backend || "").trim(),
+  ]
+    .join("\n")
+    .trim();
 }
 
-/* ---------------- OPENAI CALL (NO temperature) ---------------- */
+function extractBetweenAny(text, startPatterns, endPatterns) {
+  let startIdx = -1;
+  let startLen = 0;
 
-async function callOpenAI(env, { model, instructions, input, max_output_tokens, timeoutMs, tools, include, reasoning, verbosity }) {
+  for (const sp of startPatterns) {
+    const m = text.match(sp);
+    if (m && m.index != null) {
+      startIdx = m.index;
+      startLen = m[0].length;
+      break;
+    }
+  }
+  if (startIdx === -1) return "";
+
+  const from = startIdx + startLen;
+  let endIdx = -1;
+
+  for (const ep of endPatterns) {
+    const re = new RegExp(ep.source, ep.flags);
+    re.lastIndex = from;
+    const m2 = re.exec(text.slice(from));
+    if (m2 && m2.index != null) {
+      endIdx = from + m2.index;
+      break;
+    }
+  }
+
+  if (endIdx === -1) return text.slice(from);
+  return text.slice(from, endIdx);
+}
+
+function extractAfterAny(text, startPatterns) {
+  for (const sp of startPatterns) {
+    const m = text.match(sp);
+    if (m && m.index != null) {
+      return text.slice(m.index + m[0].length);
+    }
+  }
+  return "";
+}
+
+function splitBullets(block) {
+  const lines = String(block || "")
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+
+  // allow bullets separated by newline only
+  return lines;
+}
+
+function normalizeSpaces(s) {
+  return String(s || "").replace(/\s+/g, " ").trim();
+}
+
+/* ---------------- DESCRIPTION FIX (targeted) ---------------- */
+async function fixDescriptionOnly(env, ctx) {
+  const instr = `You are an Amazon listing copywriter.
+
+HARD REQUIREMENTS:
+- Language: ${ctx.outLang}
+- DESCRIPTION length MUST be ${ctx.DESC_MIN}–${ctx.DESC_MAX} characters (including spaces).
+- Detailed, multi-paragraph, conversion-oriented, readable.
+- No medical claims, no guarantees.
+- Output ONLY the description text (plain text).`;
+
+  const uspLine = ctx.usp ? `USPs: ${ctx.usp}\n` : "";
+  const bvLine = ctx.brandVoice ? `Brand voice: ${ctx.brandVoice}\n` : "";
+
+  const inp = `Marketplace: ${ctx.marketplace}
+Brand name: ${ctx.brandName}
+${uspLine}${bvLine}
+Product info: ${ctx.userPrompt}
+
+Current description:
+${ctx.currentDesc}
+
+Rewrite the description to meet the length requirement exactly within range.`;
+
+  const data = await callOpenAI(env, instr, inp, {
+    max_output_tokens: 2600,
+    temperature: 0.55,
+    timeoutMs: 60000,
+  });
+
+  const out = extractText(data);
+  const clean = String(out || "").trim();
+  const len = normalizeSpaces(clean).length;
+
+  if (len < ctx.DESC_MIN || len > ctx.DESC_MAX) return "";
+  return clean;
+}
+
+/* ---------------- OpenAI call helper ---------------- */
+async function callOpenAI(env, instructions, input, { max_output_tokens, temperature, timeoutMs }) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), timeoutMs || 60000);
-
-  const body = {
-    model,
-    instructions,
-    input,
-    max_output_tokens: max_output_tokens ?? 2000,
-    text: { format: { type: "text" }, verbosity: verbosity || "medium" },
-  };
-
-  if (reasoning) body.reasoning = reasoning;
-  if (Array.isArray(tools) && tools.length) {
-    body.tools = tools;
-    body.tool_choice = "auto";
-  }
-  if (Array.isArray(include) && include.length) body.include = include;
 
   const resp = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -283,11 +372,18 @@ async function callOpenAI(env, { model, instructions, input, max_output_tokens, 
       Authorization: `Bearer ${env.OPENAI_API_KEY}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      model: env.OPENAI_MODEL || "gpt-5.2",
+      instructions,
+      input,
+      max_output_tokens: max_output_tokens ?? 3200,
+      temperature: temperature ?? 0.7,
+      text: { format: { type: "text" } },
+    }),
   }).finally(() => clearTimeout(timeout));
 
-  const ct = resp.headers.get("content-type") || "";
-  const data = ct.includes("application/json") ? await resp.json() : { raw: await resp.text() };
+  const contentType = resp.headers.get("content-type") || "";
+  const data = contentType.includes("application/json") ? await resp.json() : { raw: await resp.text() };
 
   if (!resp.ok) {
     const msg = data?.error?.message || data?.raw || "OpenAI error";
@@ -297,273 +393,28 @@ async function callOpenAI(env, { model, instructions, input, max_output_tokens, 
 }
 
 function extractText(data) {
-  if (typeof data?.output_text === "string" && data.output_text.trim()) return data.output_text.trim();
-  const out = data?.output;
-  if (!Array.isArray(out)) return "";
-  const parts = [];
-  for (const item of out) {
-    const content = item?.content;
-    if (!Array.isArray(content)) continue;
-    for (const c of content) {
-      if (c?.type === "output_text" && typeof c?.text === "string") parts.push(c.text);
-      else if (typeof c?.text === "string") parts.push(c.text);
-    }
+  if (typeof data?.output_text === "string" && data.output_text.trim()) {
+    return data.output_text.trim();
   }
-  return parts.join("\n").trim();
-}
 
-/* ---------------- SOURCES (Phase 1) ---------------- */
-
-function extractWebSources(data) {
-  const urls = [];
   const out = data?.output;
-  if (!Array.isArray(out)) return urls;
-
-  for (const item of out) {
-    if (item?.type === "web_search_call" && item?.action?.sources && Array.isArray(item.action.sources)) {
-      for (const src of item.action.sources) {
-        const u = src?.url || src?.source_url || "";
-        if (u && /^https?:\/\//i.test(u)) urls.push(u);
-      }
-    }
-  }
-  return [...new Set(urls)].slice(0, 15);
-}
-
-function ensurePhase1Sources(phase1Text, urls) {
-  let s = String(phase1Text || "").trim();
-  if (!s) s = "ФАЗА 1 · РЕСЪРЧ (резюме)\n";
-
-  const has = /•\s*Източници\s*:/i.test(s);
-  if (has) return s;
-
-  const list = (urls || []).filter(u => /^https?:\/\//i.test(u)).slice(0, 12);
-  const sourcesLine = `• Източници: ${(list.length ? list : ["https://www.amazon.de/"]).map(u => `[${u}]`).join(" ")}`;
-
-  return `${s}\n${sourcesLine}\n`.trim();
-}
-
-/* ---------------- PHASE 2 URL STRIP ---------------- */
-
-function stripUrlsInPhase2(full) {
-  const s = String(full || "");
-  const idx = s.search(/ФАЗА\s*2/i);
-  if (idx < 0) return s;
-
-  const before = s.slice(0, idx);
-  let after = s.slice(idx);
-
-  // Remove URLs in Phase 2 part only
-  after = after.replace(/https?:\/\/\S+/gi, "");
-  return (before + after).trim();
-}
-
-/* ---------------- POST-PROCESS: backend ASCII + counters ---------------- */
-
-function postProcessCountersAndBackend(full, { brandName, cfg }) {
-  let s = String(full || "").trim();
-  if (!s) return s;
-
-  // Normalize backend line(s) to ASCII and remove brand
-  s = s.replace(/(Backend\s*[—-]\s*Generic\s*Keywords[^\n]*\n)([^\n]+)/gi, (m, h, line) => {
-    let clean = asciiNormalizeBackend(line);
-    clean = removeBrandToken(clean, brandName);
-    clean = hardTrimBackendToBytes(clean, cfg.BACKEND_MAX_BYTES);
-    const bytes = byteLen(clean);
-    // Ensure header contains (Bytes: Y)
-    let header = h.replace(/\(Bytes:\s*\d+\)/i, "").trimEnd();
-    if (!/\(Bytes:/i.test(header)) header = header.replace(/:\s*$/,"").trimEnd() + ` (Bytes: ${bytes}):\n`;
-    else header = header.replace(/:\s*$/,"").trimEnd() + `:\n`;
-    return header + clean;
-  });
-
-  // Refresh Title counters
-  s = s.replace(/^\s*1\.\s*(.+?)(\s*\(Chars:\s*\d+\s*\))?\s*$/gim, (m, t) => {
-    const txt = stripCounterSuffix(String(t || "")).trim();
-    return `1. ${txt} (Chars: ${txt.length})`;
-  });
-  s = s.replace(/^\s*2\.\s*(.+?)(\s*\(Chars:\s*\d+\s*\))?\s*$/gim, (m, t) => {
-    const txt = stripCounterSuffix(String(t || "")).trim();
-    return `2. ${txt} (Chars: ${txt.length})`;
-  });
-
-  // Refresh Description counter
-  s = refreshDescriptionCounter(s);
-
-  return s.trim();
-
-  function refreshDescriptionCounter(text) {
-    const lines = text.split("\n");
-    for (let i = 0; i < lines.length; i++) {
-      if (/^Product\s*Description/i.test(lines[i])) {
-        // collect until Backend line
-        let j = i + 1;
-        const descLines = [];
-        for (; j < lines.length; j++) {
-          if (/^Backend\s*[—-]/i.test(lines[j])) break;
-          descLines.push(lines[j]);
+  if (Array.isArray(out)) {
+    const parts = [];
+    for (const item of out) {
+      const content = item?.content;
+      if (Array.isArray(content)) {
+        for (const c of content) {
+          if (c?.type === "output_text" && typeof c?.text === "string") parts.push(c.text);
+          else if (typeof c?.text === "string") parts.push(c.text);
         }
-        const descText = descLines.join("\n").trim();
-        lines[i] = `Product Description (Chars: ${descText.length})`;
       }
     }
-    return lines.join("\n");
-  }
-}
-
-function stripCounterSuffix(s) {
-  return String(s || "").replace(/\s*\(Chars:\s*\d+\s*\)\s*$/i, "").trim();
-}
-
-function asciiNormalizeBackend(s) {
-  let x = String(s || "");
-  x = x
-    .replace(/Ä/g, "Ae").replace(/Ö/g, "Oe").replace(/Ü/g, "Ue")
-    .replace(/ä/g, "ae").replace(/ö/g, "oe").replace(/ü/g, "ue")
-    .replace(/ß/g, "ss");
-  x = x.replace(/[^\x00-\x7F]/g, " ");
-  x = x.replace(/[,\.;:|/\\]+/g, " ");
-  x = x.replace(/\s+/g, " ").trim();
-  return x;
-}
-
-function removeBrandToken(backend, brand) {
-  const b = String(brand || "").trim().toLowerCase();
-  if (!b) return backend;
-  return backend
-    .split(/\s+/)
-    .filter(tok => tok.toLowerCase() !== b)
-    .join(" ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function hardTrimBackendToBytes(backend, maxBytes) {
-  const toks = String(backend || "").split(/\s+/).filter(Boolean);
-  let out = [];
-  for (const tok of toks) {
-    const cand = out.length ? out.join(" ") + " " + tok : tok;
-    if (byteLen(cand) <= maxBytes) out.push(tok);
-    else break;
-  }
-  return out.join(" ");
-}
-
-function byteLen(s) {
-  return new TextEncoder().encode(String(s || "")).length;
-}
-
-/* ---------------- VALIDATION (Phase 2 only, minimal & fast) ---------------- */
-
-function validatePhase2(full, { brandName, cfg, variants }) {
-  const errors = [];
-  const s = String(full || "");
-
-  const idx = s.search(/ФАЗА\s*2/i);
-  if (idx < 0) return { ok: false, errors: ["Missing Phase 2 heading."] };
-  const phase2 = s.slice(idx);
-
-  const blocks = splitVariantsPhase2(phase2, variants);
-  for (const b of blocks) {
-    const label = b.label || "OUTPUT";
-    const t = b.text;
-
-    const titles = parseTitles(t);
-    if (titles.length !== 2) errors.push(`${label}: titles found ${titles.length}/2`);
-    else {
-      titles.forEach((title, i) => {
-        const len = title.length;
-        if (len < cfg.TITLE_MIN || len > cfg.TITLE_MAX || len > cfg.TITLE_HARD_MAX)
-          errors.push(`${label}: title ${i + 1} len=${len} (need ${cfg.TITLE_MIN}-${cfg.TITLE_MAX}, hard<=${cfg.TITLE_HARD_MAX})`);
-        if (!title.toLowerCase().startsWith(String(brandName).toLowerCase()))
-          errors.push(`${label}: title ${i + 1} must start with brand`);
-      });
-    }
-
-    const bullets = parseBullets(t);
-    if (bullets.length !== cfg.BULLET_COUNT) errors.push(`${label}: bullets count ${bullets.length}/${cfg.BULLET_COUNT}`);
-    bullets.forEach((bl, i) => {
-      const line = bl.replace(/\s+/g, " ").trim();
-      const len = line.length;
-      if (len < cfg.BULLET_MIN || len > cfg.BULLET_MAX)
-        errors.push(`${label}: bullet ${i + 1} len=${len} (need ${cfg.BULLET_MIN}-${cfg.BULLET_MAX})`);
-      if (!/^•\s*\*\*.+\*\*:\s+/.test(line))
-        errors.push(`${label}: bullet ${i + 1} bad format`);
-    });
-
-    const desc = parseDescription(t);
-    const dlen = desc.length;
-    if (dlen < cfg.DESC_MIN || dlen > cfg.DESC_MAX)
-      errors.push(`${label}: description len=${dlen} (need ${cfg.DESC_MIN}-${cfg.DESC_MAX})`);
-
-    const backend = parseBackend(t);
-    const bytes = byteLen(asciiNormalizeBackend(backend));
-    if (bytes > cfg.BACKEND_MAX_BYTES)
-      errors.push(`${label}: backend bytes=${bytes} (need <=${cfg.BACKEND_MAX_BYTES})`);
-    if (backend.toLowerCase().includes(String(brandName).toLowerCase()))
-      errors.push(`${label}: backend contains brand (not allowed)`);
+    const joined = parts.join("\n").trim();
+    if (joined) return joined;
   }
 
-  return { ok: errors.length === 0, errors };
+  return "";
 }
-
-function splitVariantsPhase2(phase2, variantsExpected) {
-  const lines = String(phase2 || "").split("\n");
-  const header = lines[0] || "";
-  const rest = lines.slice(1).join("\n").trim();
-
-  const re = /\bVARIANT\s+[ABC]\b/gi;
-  const matches = [];
-  let m;
-  while ((m = re.exec(rest)) !== null) matches.push({ idx: m.index, label: m[0].toUpperCase() });
-
-  if (!matches.length) return [{ label: "", text: rest || "" }];
-
-  const out = [];
-  for (let i = 0; i < matches.length; i++) {
-    const start = matches[i].idx;
-    const end = i + 1 < matches.length ? matches[i + 1].idx : rest.length;
-    const chunk = rest.slice(start, end).trim();
-    const firstLine = chunk.split("\n")[0].trim();
-    out.push({ label: firstLine, text: chunk.slice(firstLine.length).trim() });
-  }
-
-  return variantsExpected === 1 ? [out[0]] : out;
-}
-
-function parseTitles(block) {
-  const lines = String(block || "").split("\n").map(l => l.trim());
-  const t1 = lines.find(l => /^1\./.test(l));
-  const t2 = lines.find(l => /^2\./.test(l));
-  const out = [];
-  if (t1) out.push(t1.replace(/^1\.\s*/, "").replace(/\(Chars:\s*\d+\)\s*$/i, "").trim());
-  if (t2) out.push(t2.replace(/^2\.\s*/, "").replace(/\(Chars:\s*\d+\)\s*$/i, "").trim());
-  return out;
-}
-
-function parseBullets(block) {
-  return String(block || "")
-    .split("\n")
-    .map(l => l.trim())
-    .filter(l => l.startsWith("•"));
-}
-
-function parseDescription(block) {
-  const s = String(block || "");
-  const start = s.search(/Product\s*Description/i);
-  const end = s.search(/Backend\s*[—-]/i);
-  if (start < 0 || end < 0 || end <= start) return "";
-  const desc = s.slice(start, end).split("\n").slice(1).join("\n").trim();
-  return desc;
-}
-
-function parseBackend(block) {
-  const s = String(block || "");
-  const m = /Backend\s*[—-][^\n]*\n([^\n]+)/i.exec(s);
-  return (m && m[1]) ? m[1].trim() : "";
-}
-
-/* ---------------- RESPONSE ---------------- */
 
 function json(obj, status = 200) {
   return new Response(JSON.stringify(obj), {

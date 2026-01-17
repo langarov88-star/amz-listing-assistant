@@ -20,6 +20,12 @@ VARIANT C
 
 
   const { request, env } = context;
+if (!env?.OPENAI_API_KEY) {
+  return new Response(JSON.stringify({ error: "OPENAI_API_KEY missing in runtime env" }), {
+    status: 500,
+    headers: { "Content-Type": "application/json; charset=utf-8" }
+  });
+}
 
   try {
     if (!env?.OPENAI_API_KEY) {

@@ -1,11 +1,11 @@
 export async function onRequestPost(context) {
   const { request, env } = context;
-  if (!env?.OPENAI_API_KEY) {
-  return json({ error: "OPENAI_API_KEY is missing in runtime env (Production)" }, 500);
-}
-
 
   try {
+    if (!env?.OPENAI_API_KEY) {
+      return json({ error: "OPENAI_API_KEY is missing in Pages environment (Production)." }, 500);
+    }
+
     const body = await request.json();
     const marketplace = String(body.marketplace || "").trim();
     const brandVoice = String(body.brand_voice || "").trim();
@@ -44,8 +44,13 @@ D) BACKEND SEARCH TERMS: (250–500 chars, space-separated, no repeats)`;
     const brandLine = brandVoice ? `\nBrand voice: ${brandVoice}` : "";
     const input = `${system}\n\n---\nMarketplace: ${marketplace}${brandLine}\n\nUser prompt:\n${userPrompt}\n---\nReturn ONLY A–D.`;
 
+    // Timeout защита
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 40000);
+
     const resp = await fetch("https://api.openai.com/v1/responses", {
       method: "POST",
+      signal: controller.signal,
       headers: {
         "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
         "Content-Type": "application/json"
@@ -54,16 +59,53 @@ D) BACKEND SEARCH TERMS: (250–500 chars, space-separated, no repeats)`;
         model: env.OPENAI_MODEL || "gpt-5.2",
         input
       })
-    });
+    }).finally(() => clearTimeout(timeout));
 
-    const data = await resp.json();
-    if (!resp.ok) return json({ error: data?.error?.message || "OpenAI error" }, resp.status);
+    const contentType = resp.headers.get("content-type") || "";
+    const data = contentType.includes("application/json")
+      ? await resp.json()
+      : { raw: await resp.text() };
 
-    return json({ output: data.output_text || "" }, 200);
+    if (!resp.ok) {
+      return json({ error: data?.error?.message || data?.raw || "OpenAI error" }, resp.status);
+    }
 
+    const output = extractText(data);
+    if (!output) {
+      return json({ error: "OpenAI returned an empty output. Check model availability and response format.", debug: data }, 500);
+    }
+
+    return json({ output }, 200);
   } catch (e) {
-    return json({ error: e?.message || "Server error" }, 500);
+    const msg =
+      e?.name === "AbortError"
+        ? "Timeout while calling OpenAI (40s). Try again or reduce prompt."
+        : (e?.message || "Server error");
+    return json({ error: msg }, 500);
   }
+}
+
+// Вади текст и от output_text, и от output[].content[].text
+function extractText(data) {
+  if (typeof data?.output_text === "string" && data.output_text.trim()) return data.output_text.trim();
+
+  // Responses API често има output масив
+  const out = data?.output;
+  if (Array.isArray(out)) {
+    const parts = [];
+    for (const item of out) {
+      const content = item?.content;
+      if (Array.isArray(content)) {
+        for (const c of content) {
+          if (typeof c?.text === "string") parts.push(c.text);
+          if (typeof c?.content === "string") parts.push(c.content);
+        }
+      }
+    }
+    const joined = parts.join("\n").trim();
+    if (joined) return joined;
+  }
+  return "";
 }
 
 function json(obj, status = 200) {

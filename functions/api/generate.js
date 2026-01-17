@@ -1233,28 +1233,39 @@ function extractWebSources(data) {
 
 /* ---------------- OpenAI call helper ---------------- */
 
-async function callOpenAI(env, instructions, input, { max_output_tokens, temperature, timeoutMs, tools, include, reasoning }) {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs || 60000);
+async function callOpenAI(env, instructions, input, opts = {}) {
+  const {
+    max_output_tokens = 3200,
+    timeoutMs = 60000,
+    tools,
+    include,
+    reasoning,
+    verbosity = "medium",
+  } = opts;
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+
+  // IMPORTANT: We intentionally DO NOT accept/forward "temperature" at all.
   const body = {
     model: env.OPENAI_MODEL || "gpt-5.2",
     instructions,
     input,
-    max_output_tokens: max_output_tokens ?? 3200,
-    temperature: temperature ?? 0.7,
-    text: { format: { type: "text" } },
+    max_output_tokens,
+    text: {
+      format: { type: "text" },
+      verbosity, // controls length/style without temperature
+    },
   };
 
-  if (tools && Array.isArray(tools) && tools.length) {
+  if (reasoning) body.reasoning = reasoning;
+
+  if (Array.isArray(tools) && tools.length) {
     body.tools = tools;
     body.tool_choice = "auto";
   }
-  if (include && Array.isArray(include) && include.length) {
+  if (Array.isArray(include) && include.length) {
     body.include = include;
-  }
-  if (reasoning) {
-    body.reasoning = reasoning;
   }
 
   const resp = await fetch("https://api.openai.com/v1/responses", {
@@ -1268,7 +1279,9 @@ async function callOpenAI(env, instructions, input, { max_output_tokens, tempera
   }).finally(() => clearTimeout(timeout));
 
   const contentType = resp.headers.get("content-type") || "";
-  const data = contentType.includes("application/json") ? await resp.json() : { raw: await resp.text() };
+  const data = contentType.includes("application/json")
+    ? await resp.json()
+    : { raw: await resp.text() };
 
   if (!resp.ok) {
     const msg = data?.error?.message || data?.raw || "OpenAI error";
@@ -1276,6 +1289,7 @@ async function callOpenAI(env, instructions, input, { max_output_tokens, tempera
   }
   return data;
 }
+
 
 function extractText(data) {
   if (typeof data?.output_text === "string" && data.output_text.trim()) {

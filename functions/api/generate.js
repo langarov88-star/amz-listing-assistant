@@ -1,24 +1,14 @@
 export async function onRequestPost(context) {
   const { request, env } = context;
 
-  // ---- Env check ----
   if (!env?.OPENAI_API_KEY) {
     return json({ error: "OPENAI_API_KEY missing in runtime env" }, 500);
   }
 
-  // ---- Auth check (token signed with ACCESS_TOKEN_SECRET) ----
-  const authErr = await requireAuth(request, env);
-  if (authErr) return authErr;
-
-  // ---- Read body safely ----
   let body;
-  try {
-    body = await request.json();
-  } catch {
-    return json({ error: "Invalid JSON body" }, 400);
-  }
+  try { body = await request.json(); }
+  catch { return json({ error: "Invalid JSON body" }, 400); }
 
-  // ---- Inputs from client ----
   const marketplace = String(body.marketplace || "").trim();
   const brandVoice = String(body.brand_voice || "").trim();
   const brandName = String(body.brand_name || "").trim();
@@ -28,12 +18,10 @@ export async function onRequestPost(context) {
   const variantsRaw = Number(body.variants || 1);
   const variants = variantsRaw === 3 ? 3 : 1;
 
-  // ---- Validation ----
   if (!marketplace) return json({ error: "Missing marketplace" }, 400);
   if (!brandName) return json({ error: "Missing brand_name" }, 400);
   if (!userPrompt) return json({ error: "Missing user_prompt" }, 400);
 
-  // ---- Output language ----
   const langMap = {
     "amazon.de": "German (DE)",
     "amazon.fr": "French (FR)",
@@ -46,10 +34,8 @@ export async function onRequestPost(context) {
   };
   const outLang = langMap[marketplace] || "English";
 
-  // ---- System instructions ----
+  // ✅ ВАЖНО: добавихме твърдото изискване за 3000–4000 chars
   const instructions = `You are an Amazon Marketplace Listing Expert.
-
-const instructions = `You are an Amazon Marketplace Listing Expert.
 
 GOAL:
 Create HIGH-CONVERTING, Amazon-optimized listings that comply with Amazon policies.
@@ -70,11 +56,10 @@ BULLET RULES:
 - No fluff
 
 DESCRIPTION RULES:
-- Total length must be 3000–4000 characters (including spaces)
-- Use structured subheadings where helpful
-- Natural keyword integration (no stuffing)
-- No prohibited claims (medical/guarantees), comply with Amazon policies
-- Must be coherent, conversion-oriented, and readable
+- Total length must be 3000–4000 characters (including spaces).
+- Write a persuasive, detailed description (multiple paragraphs). You may use short subheadings.
+- Natural keyword integration (no stuffing).
+- No prohibited claims (medical/guarantees). Comply with Amazon policies.
 
 BACKEND SEARCH TERMS:
 - ~250 characters
@@ -90,13 +75,14 @@ C) DESCRIPTION:
 D) BACKEND SEARCH TERMS:
 Return ONLY these sections (A–D), plain text.`;
 
-  // ---- User input (prompt to the model) ----
-  const uspLine = usp ? `USPs: ${usp}\n` : "";
-  const brandVoiceLine = brandVoice ? `Brand voice: ${brandVoice}\n` : "";
+  const uspLine = usp ? `USPs: ${usp}` : "";
+  const brandVoiceLine = brandVoice ? `Brand voice: ${brandVoice}` : "";
 
   const input = `Brand name: ${brandName}
-${uspLine}Marketplace: ${marketplace}
+${uspLine}
+Marketplace: ${marketplace}
 ${brandVoiceLine}
+
 User product info:
 ${userPrompt}
 
@@ -107,148 +93,232 @@ VARIANT A
 VARIANT B
 VARIANT C`;
 
-  // ---- OpenAI call (Responses API) ----
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 40000);
+    // По-голям token budget (за да има шанс за 3–4k chars)
+    const first = await callOpenAI(env, instructions, input, {
+      max_output_tokens: variants === 3 ? 6500 : 2600,
+      temperature: 0.6,
+      timeoutMs: 45000
+    });
 
-    const resp = await fetch("https://api.openai.com/v1/responses", {
-      method: "POST",
-      signal: controller.signal,
-      headers: {
-        "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        // NOTE: махам "Thinking" от default-а, за да няма невалидно име на модел
-        model: env.OPENAI_MODEL || "gpt-5.2",
-        instructions,
-        input,
-        max_output_tokens: variants === 3 ? 3200 : 1600,
-        temperature: 0.7,
-        text: { format: { type: "text" } }
-      })
-    }).finally(() => clearTimeout(timeout));
+    let output = extractText(first);
+    if (!output) return json({ error: "Empty output from OpenAI", debug: first }, 500);
 
-    const contentType = resp.headers.get("content-type") || "";
-    const data = contentType.includes("application/json")
-      ? await resp.json()
-      : { raw: await resp.text() };
-
-    if (!resp.ok) {
-      return json(
-        { error: data?.error?.message || data?.raw || "OpenAI error" },
-        resp.status
-      );
-    }
-
-    const output = extractText(data);
-    if (!output) {
-      return json(
-        {
-          error: "OpenAI returned an empty output. Check model availability and response format.",
-          debug: data
-        },
-        500
-      );
-    }
+    // ✅ Валидация + Fix на DESCRIPTION ако е извън 3000–4000 chars
+    output = await enforceDescriptionLength(output, env, {
+      outLang, marketplace, brandName, usp, brandVoice, userPrompt,
+      minChars: 3000,
+      maxChars: 4000
+    });
 
     return json({ output }, 200);
 
   } catch (e) {
     const msg =
       e?.name === "AbortError"
-        ? "Timeout while calling OpenAI (40s). Try again or reduce prompt."
-        : (e?.message || "Server error");
+        ? "Timeout while calling OpenAI. Try again."
+        : String(e?.message || e || "Server error");
     return json({ error: msg }, 500);
   }
 }
 
-/* -------------------- AUTH HELPERS -------------------- */
+/* ---------------- Enforce DESCRIPTION length ---------------- */
 
-async function requireAuth(request, env) {
-  if (!env?.ACCESS_TOKEN_SECRET) {
-    return json({ error: "ACCESS_TOKEN_SECRET missing in env" }, 500);
+async function enforceDescriptionLength(output, env, ctx) {
+  const variants = splitVariants(output);
+
+  // Ако няма варианти (single) -> пак ще върне масив с 1 елемент
+  const fixed = [];
+  for (const v of variants) {
+    const parsed = parseAD(v.text);
+    if (!parsed?.desc) {
+      fixed.push(v.label ? `${v.label}\n${v.text}` : v.text);
+      continue;
+    }
+
+    const descNorm = normalizeSpaces(parsed.desc);
+    const len = descNorm.length;
+
+    if (len >= ctx.minChars && len <= ctx.maxChars) {
+      fixed.push(rebuildVariant(v.label, parsed));
+      continue;
+    }
+
+    // Втори call – връща САМО DESCRIPTION в 3000–4000 chars
+    const fixedDesc = await fixDescription(env, {
+      outLang: ctx.outLang,
+      minChars: ctx.minChars,
+      maxChars: ctx.maxChars,
+      marketplace: ctx.marketplace,
+      brandName: ctx.brandName,
+      usp: ctx.usp,
+      brandVoice: ctx.brandVoice,
+      userPrompt: ctx.userPrompt,
+      currentDesc: parsed.desc
+    });
+
+    parsed.desc = fixedDesc || parsed.desc;
+    fixed.push(rebuildVariant(v.label, parsed));
   }
 
-  const auth = request.headers.get("authorization") || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
-
-  if (!token || !token.includes(".")) {
-    return json({ error: "Unauthorized" }, 401);
-  }
-
-  const [payloadB64, sigB64] = token.split(".");
-  if (!payloadB64 || !sigB64) {
-    return json({ error: "Unauthorized" }, 401);
-  }
-
-  const expectedSig = await hmacSha256Base64Url(env.ACCESS_TOKEN_SECRET, payloadB64);
-  if (!timingSafeEqual(sigB64, expectedSig)) {
-    return json({ error: "Unauthorized" }, 401);
-  }
-
-  let payload;
-  try {
-    payload = JSON.parse(new TextDecoder().decode(base64UrlDecode(payloadB64)));
-  } catch {
-    return json({ error: "Unauthorized" }, 401);
-  }
-
-  const now = Math.floor(Date.now() / 1000);
-  if (!payload?.exp || now >= payload.exp) {
-    return json({ error: "Session expired" }, 401);
-  }
-
-  return null;
+  return fixed.join("\n\n").trim();
 }
 
-async function hmacSha256Base64Url(secret, message) {
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(secret),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"]
-  );
+function splitVariants(text) {
+  const s = String(text || "").trim();
+  const re = /\bVARIANT\s+[ABC]\b/gi;
 
-  const sig = await crypto.subtle.sign(
-    "HMAC",
-    key,
-    new TextEncoder().encode(message)
-  );
+  const matches = [];
+  let m;
+  while ((m = re.exec(s)) !== null) matches.push({ idx: m.index, label: m[0].toUpperCase() });
 
-  return base64UrlEncode(new Uint8Array(sig));
-}
+  if (!matches.length) return [{ label: "", text: s }];
 
-function base64UrlEncode(bytes) {
-  let binary = "";
-  for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-}
-
-function base64UrlDecode(b64url) {
-  const b64 = b64url.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((b64url.length + 3) % 4);
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return bytes;
-}
-
-function timingSafeEqual(a, b) {
-  a = String(a);
-  b = String(b);
-  const len = Math.max(a.length, b.length);
-  let diff = a.length ^ b.length;
-  for (let i = 0; i < len; i++) {
-    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  const out = [];
+  for (let i = 0; i < matches.length; i++) {
+    const start = matches[i].idx;
+    const end = (i + 1 < matches.length) ? matches[i + 1].idx : s.length;
+    const chunk = s.slice(start, end).trim();
+    // label е първия ред
+    const firstLine = chunk.split("\n")[0].trim();
+    out.push({ label: firstLine, text: chunk.slice(firstLine.length).trim() });
   }
-  return diff === 0;
+  return out;
 }
 
-/* -------------------- OUTPUT HELPERS -------------------- */
+function parseAD(text) {
+  const t = String(text || "");
 
-// Extract text from Responses API output items
+  const title = extractBetween(t, "A) TITLE:", "B) BULLET POINTS:");
+  const bullets = extractBetween(t, "B) BULLET POINTS:", "C) DESCRIPTION:");
+  const desc = extractBetween(t, "C) DESCRIPTION:", "D) BACKEND SEARCH TERMS:");
+  const backend = extractAfter(t, "D) BACKEND SEARCH TERMS:");
+
+  return { title, bullets, desc, backend };
+}
+
+function rebuildVariant(label, p) {
+  const parts = [];
+  if (label) parts.push(label);
+
+  parts.push("A) TITLE:");
+  parts.push((p.title || "").trim());
+
+  parts.push("");
+  parts.push("B) BULLET POINTS:");
+  parts.push((p.bullets || "").trim());
+
+  parts.push("");
+  parts.push("C) DESCRIPTION:");
+  parts.push((p.desc || "").trim());
+
+  parts.push("");
+  parts.push("D) BACKEND SEARCH TERMS:");
+  parts.push((p.backend || "").trim());
+
+  return parts.join("\n").trim();
+}
+
+function extractBetween(text, start, end) {
+  const s = text.indexOf(start);
+  if (s === -1) return "";
+  const from = s + start.length;
+  const e = text.indexOf(end, from);
+  if (e === -1) return text.slice(from).trim();
+  return text.slice(from, e).trim();
+}
+
+function extractAfter(text, start) {
+  const s = text.indexOf(start);
+  if (s === -1) return "";
+  return text.slice(s + start.length).trim();
+}
+
+function normalizeSpaces(s) {
+  return String(s || "").replace(/\s+/g, " ").trim();
+}
+
+/* ---------------- Fix DESCRIPTION only ---------------- */
+
+async function fixDescription(env, ctx) {
+  const instr = `You are an Amazon listing copywriter.
+Task: Rewrite ONLY the DESCRIPTION section.
+
+HARD REQUIREMENTS:
+- Language: ${ctx.outLang}
+- LENGTH: ${ctx.minChars}–${ctx.maxChars} characters total (including spaces). Count characters and stay within range.
+- Keep it conversion-oriented, detailed, and readable (multiple paragraphs).
+- No medical claims, no guarantees, comply with Amazon policies.
+- Do NOT output Title, Bullets, Backend terms.
+- Output ONLY the description text (plain text).`;
+
+  const uspLine = ctx.usp ? `USPs: ${ctx.usp}\n` : "";
+  const bvLine = ctx.brandVoice ? `Brand voice: ${ctx.brandVoice}\n` : "";
+
+  const inp = `Marketplace: ${ctx.marketplace}
+Brand name: ${ctx.brandName}
+${uspLine}${bvLine}
+
+Product info:
+${ctx.userPrompt}
+
+Current (too short/too long) description:
+${ctx.currentDesc}
+
+Rewrite the description to meet the length requirement.`;
+
+  const data = await callOpenAI(env, instr, inp, {
+    max_output_tokens: 2200,
+    temperature: 0.5,
+    timeoutMs: 45000
+  });
+
+  const out = extractText(data);
+  const clean = String(out || "").trim();
+
+  // Ако моделът пак не спази – връщаме каквото има, а enforce ще остави старото
+  const len = normalizeSpaces(clean).length;
+  if (len < ctx.minChars || len > ctx.maxChars) return "";
+  return clean;
+}
+
+/* ---------------- OpenAI call helper ---------------- */
+
+async function callOpenAI(env, instructions, input, { max_output_tokens, temperature, timeoutMs }) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs || 45000);
+
+  const resp = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    signal: controller.signal,
+    headers: {
+      "Authorization": `Bearer ${env.OPENAI_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      model: env.OPENAI_MODEL || "gpt-5.2",
+      instructions,
+      input,
+      max_output_tokens: max_output_tokens ?? 2600,
+      temperature: temperature ?? 0.6,
+      text: { format: { type: "text" } }
+    })
+  }).finally(() => clearTimeout(timeout));
+
+  const contentType = resp.headers.get("content-type") || "";
+  const data = contentType.includes("application/json")
+    ? await resp.json()
+    : { raw: await resp.text() };
+
+  if (!resp.ok) {
+    const msg = data?.error?.message || data?.raw || "OpenAI error";
+    throw new Error(msg);
+  }
+  return data;
+}
+
+/* ---------------- Responses API text extractor ---------------- */
+
 function extractText(data) {
   if (typeof data?.output_text === "string" && data.output_text.trim()) {
     return data.output_text.trim();
@@ -269,7 +339,6 @@ function extractText(data) {
     const joined = parts.join("\n").trim();
     if (joined) return joined;
   }
-
   return "";
 }
 

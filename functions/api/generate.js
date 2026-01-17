@@ -1,68 +1,61 @@
 export async function onRequestPost(context) {
-  const brandName = String(body.brand_name || "").trim();
-const uspLine = usp ? `USPs: ${usp}` : "";
-
-const input = `
-Brand name: ${brandName}
-${uspLine}
-Marketplace: ${marketplace}
-
-User product info:
-${userPrompt}
-
-Generate ${variants === 3 ? "THREE distinct variants (A/B/C)" : "ONE version"}.
-Each variant must fully include A–D.
-If 3 variants, clearly label them as:
-VARIANT A
-VARIANT B
-VARIANT C
-`;
-
-
   const { request, env } = context;
-if (!env?.OPENAI_API_KEY) {
-  return new Response(JSON.stringify({ error: "OPENAI_API_KEY missing in runtime env" }), {
-    status: 500,
-    headers: { "Content-Type": "application/json; charset=utf-8" }
-  });
-}
 
+  // ---- Env check ----
+  if (!env?.OPENAI_API_KEY) {
+    return json({ error: "OPENAI_API_KEY missing in runtime env" }, 500);
+  }
+
+  // ---- Read body safely ----
+  let body;
   try {
-    if (!env?.OPENAI_API_KEY) {
-      return json({ error: "OPENAI_API_KEY is missing in Pages environment (Production)." }, 500);
-    }
+    body = await request.json();
+  } catch {
+    return json({ error: "Invalid JSON body" }, 400);
+  }
 
-    const body = await request.json();
-    const marketplace = String(body.marketplace || "").trim();
-    const brandVoice = String(body.brand_voice || "").trim();
-    const userPrompt = String(body.user_prompt || "").trim();
+  // ---- Inputs from client ----
+  const marketplace = String(body.marketplace || "").trim();
+  const brandVoice = String(body.brand_voice || "").trim();
+  const brandName = String(body.brand_name || "").trim();
+  const usp = String(body.usp || "").trim();
+  const userPrompt = String(body.user_prompt || "").trim();
 
-    if (!marketplace) return json({ error: "Missing marketplace" }, 400);
-    if (!userPrompt) return json({ error: "Missing user_prompt" }, 400);
+  const variantsRaw = Number(body.variants || 1);
+  const variants = variantsRaw === 3 ? 3 : 1;
 
-    const langMap = {
-      "amazon.de": "German (DE)",
-      "amazon.fr": "French (FR)",
-      "amazon.it": "Italian (IT)",
-      "amazon.es": "Spanish (ES)",
-      "amazon.nl": "Dutch (NL)",
-      "amazon.pl": "Polish (PL)",
-      "amazon.se": "Swedish (SE)",
-      "amazon.co.uk": "English (UK)"
-    };
-    const outLang = langMap[marketplace] || "English";
+  // ---- Validation ----
+  if (!marketplace) return json({ error: "Missing marketplace" }, 400);
+  if (!brandName) return json({ error: "Missing brand_name" }, 400);
+  if (!userPrompt) return json({ error: "Missing user_prompt" }, 400);
 
-    const system = `You are an Amazon DE Listing Expert.
+  // ---- Output language ----
+  const langMap = {
+    "amazon.de": "German (DE)",
+    "amazon.fr": "French (FR)",
+    "amazon.it": "Italian (IT)",
+    "amazon.es": "Spanish (ES)",
+    "amazon.nl": "Dutch (NL)",
+    "amazon.pl": "Polish (PL)",
+    "amazon.se": "Swedish (SE)",
+    "amazon.co.uk": "English (UK)"
+  };
+  const outLang = langMap[marketplace] || "English";
+
+  // ---- System instructions ----
+  const instructions = `You are an Amazon Marketplace Listing Expert.
 
 GOAL:
-Create HIGH-CONVERTING, Amazon -optimized listings.
+Create HIGH-CONVERTING, Amazon-optimized listings that comply with Amazon policies.
 
-TITLE RULES :
+OUTPUT LANGUAGE: ${outLang}
+
+TITLE RULES:
 - Start with Brand Name
 - Primary keyword immediately after
 - 1–2 strongest USPs
 - No keyword stuffing
-- Max ~180–200 characters
+- Aim ~180–200 characters
 
 BULLET RULES:
 - 5 bullets
@@ -77,19 +70,32 @@ BACKEND SEARCH TERMS:
 - No generic words (creme, pflege, produkt)
 - Space-separated only
 
-OUTPUT LANGUAGE: ${outLang}
-
-OUTPUT STRUCTURE:
+OUTPUT STRUCTURE (for each variant):
 A) TITLE:
 B) BULLET POINTS:
 C) DESCRIPTION:
-D) BACKEND SEARCH TERMS:`;
+D) BACKEND SEARCH TERMS:
+Return ONLY these sections (A–D), plain text.`;
 
+  // ---- User input (prompt to the model) ----
+  const uspLine = usp ? `USPs: ${usp}\n` : "";
+  const brandVoiceLine = brandVoice ? `Brand voice: ${brandVoice}\n` : "";
 
-    const brandLine = brandVoice ? `\nBrand voice: ${brandVoice}` : "";
-    const input = `${system}\n\n---\nMarketplace: ${marketplace}${brandLine}\n\nUser prompt:\n${userPrompt}\n---\nReturn ONLY A–D.`;
+  const input = `Brand name: ${brandName}
+${uspLine}Marketplace: ${marketplace}
+${brandVoiceLine}
+User product info:
+${userPrompt}
 
-    // Timeout защита
+Generate ${variants === 3 ? "THREE distinct variants (A/B/C)" : "ONE version"}.
+Each variant must fully include A–D.
+If 3 variants, clearly label them exactly as:
+VARIANT A
+VARIANT B
+VARIANT C`;
+
+  // ---- OpenAI call (Responses API) ----
+  try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 40000);
 
@@ -101,8 +107,12 @@ D) BACKEND SEARCH TERMS:`;
         "Content-Type": "application/json"
       },
       body: JSON.stringify({
-        model: env.OPENAI_MODEL || "gpt-5.2",
-        input
+        model: env.OPENAI_MODEL || "gpt-5.2 Thinking",
+        instructions,
+        input,
+        max_output_tokens: variants === 3 ? 3200 : 1600,
+        temperature: 0.7,
+        text: { format: { type: "text" } }
       })
     }).finally(() => clearTimeout(timeout));
 
@@ -112,15 +122,25 @@ D) BACKEND SEARCH TERMS:`;
       : { raw: await resp.text() };
 
     if (!resp.ok) {
-      return json({ error: data?.error?.message || data?.raw || "OpenAI error" }, resp.status);
+      return json(
+        { error: data?.error?.message || data?.raw || "OpenAI error" },
+        resp.status
+      );
     }
 
     const output = extractText(data);
     if (!output) {
-      return json({ error: "OpenAI returned an empty output. Check model availability and response format.", debug: data }, 500);
+      return json(
+        {
+          error: "OpenAI returned an empty output. Check model availability and response format.",
+          debug: data
+        },
+        500
+      );
     }
 
     return json({ output }, 200);
+
   } catch (e) {
     const msg =
       e?.name === "AbortError"
@@ -130,11 +150,13 @@ D) BACKEND SEARCH TERMS:`;
   }
 }
 
-// Вади текст и от output_text, и от output[].content[].text
+// Extract text from Responses API output items
 function extractText(data) {
-  if (typeof data?.output_text === "string" && data.output_text.trim()) return data.output_text.trim();
+  // Some SDKs expose output_text; keep as fallback
+  if (typeof data?.output_text === "string" && data.output_text.trim()) {
+    return data.output_text.trim();
+  }
 
-  // Responses API често има output масив
   const out = data?.output;
   if (Array.isArray(out)) {
     const parts = [];
@@ -142,14 +164,15 @@ function extractText(data) {
       const content = item?.content;
       if (Array.isArray(content)) {
         for (const c of content) {
-          if (typeof c?.text === "string") parts.push(c.text);
-          if (typeof c?.content === "string") parts.push(c.content);
+          if (c?.type === "output_text" && typeof c?.text === "string") parts.push(c.text);
+          else if (typeof c?.text === "string") parts.push(c.text); // fallback
         }
       }
     }
     const joined = parts.join("\n").trim();
     if (joined) return joined;
   }
+
   return "";
 }
 

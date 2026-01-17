@@ -181,16 +181,15 @@
   }
 
   try {
-    const r = await fetch("/api/generate", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        marketplace: market.value,
-        brand_voice: brand.value || "",
-        brand_name: brandName.value.trim(),
-        usp: usp.value || "",
-        variants,
-        user_prompt: prompt.value || ""
+    const r = await fetch("/api/generate", { ... });
+
+const text = await r.text();
+let data;
+try { data = JSON.parse(text); }
+catch { data = { error: text }; }
+
+if (!r.ok) throw new Error(data?.error || "Request failed");
+result.value = data.output || "";
       })
     });
 

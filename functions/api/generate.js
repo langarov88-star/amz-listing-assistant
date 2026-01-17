@@ -64,7 +64,7 @@ OUTPUT LANGUAGE: ${outLang}
 HARD REQUIREMENTS (must be satisfied):
 - Bullet points: EXACTLY ${BULLET_COUNT} bullets.
 - Each bullet MUST be ${BULLET_MIN}–${BULLET_MAX} characters (including spaces).
-- Each bullet must start with: an emoji + a SHORT UPPERCASE label + colon, then the text.
+- Each bullet must start with: a SHORT UPPERCASE label + colon, then the text.
   Example format: "✅ HEAT PROTECTION: ..."
 - Description: MUST be ${DESC_MIN}–${DESC_MAX} characters total (including spaces).
 - Description must be detailed, multi-paragraph, conversion-oriented, readable.

@@ -1,6 +1,4 @@
-export async function onRequestPost(context) {
-  const { request, env } = context;
-
+export async function onRequestPost({ request, env }) {
   if (!env?.OPENAI_API_KEY) {
     return json({ error: "OPENAI_API_KEY missing in runtime env" }, 500);
   }
@@ -34,39 +32,39 @@ export async function onRequestPost(context) {
   };
   const outLang = langMap[marketplace] || "English";
 
-  // ✅ ВАЖНО: добавихме твърдото изискване за 3000–4000 chars
+  // ✅ ТУК: булети + описание с твърди изисквания
+  const BULLET_COUNT = 7;
+  const BULLET_MIN = 220;   // chars
+  const BULLET_MAX = 240;   // chars
+  const DESC_MIN = 3000;    // chars
+  const DESC_MAX = 4000;    // chars
+
   const instructions = `You are an Amazon Marketplace Listing Expert.
 
-GOAL:
-Create HIGH-CONVERTING, Amazon-optimized listings that comply with Amazon policies.
-
 OUTPUT LANGUAGE: ${outLang}
+
+HARD REQUIREMENTS (must be satisfied):
+- Bullet points: EXACTLY ${BULLET_COUNT} bullets.
+- Each bullet MUST be ${BULLET_MIN}–${BULLET_MAX} characters (including spaces).
+- Each bullet must start with: an emoji + a SHORT UPPERCASE label + colon, then the text.
+  Example format: "✅ HEAT PROTECTION: ..."
+
+- Description: MUST be ${DESC_MIN}–${DESC_MAX} characters total (including spaces).
+- Description must be detailed, multi-paragraph, conversion-oriented, readable.
+- No medical claims, no guarantees, comply with Amazon policies.
 
 TITLE RULES:
 - Start with Brand Name
 - Primary keyword immediately after
 - 1–2 strongest USPs
 - No keyword stuffing
-- Aim ~180–200 characters
-
-BULLET RULES:
-- 5 bullets
-- Short, scannable
-- Keyword → micro-benefit
-- No fluff
-
-DESCRIPTION RULES:
-- Total length must be 3000–4000 characters (including spaces).
-- Write a persuasive, detailed description (multiple paragraphs). You may use short subheadings.
-- Natural keyword integration (no stuffing).
-- No prohibited claims (medical/guarantees). Comply with Amazon policies.
+- Aim ~185–200 characters
 
 BACKEND SEARCH TERMS:
 - ~250 characters
 - No duplicates
 - No brand name
-- No generic words (creme, pflege, produkt)
-- Space-separated only
+- Space-separated only (no commas)
 
 OUTPUT STRUCTURE (for each variant):
 A) TITLE:
@@ -94,22 +92,72 @@ VARIANT B
 VARIANT C`;
 
   try {
-    // По-голям token budget (за да има шанс за 3–4k chars)
+    // 1) First pass
     const first = await callOpenAI(env, instructions, input, {
-      max_output_tokens: variants === 3 ? 6500 : 2600,
-      temperature: 0.6,
-      timeoutMs: 45000
+      max_output_tokens: variants === 3 ? 7500 : 3200,
+      temperature: 0.7,
+      timeoutMs: 60000
     });
 
     let output = extractText(first);
     if (!output) return json({ error: "Empty output from OpenAI", debug: first }, 500);
 
-    // ✅ Валидация + Fix на DESCRIPTION ако е извън 3000–4000 chars
-    output = await enforceDescriptionLength(output, env, {
-      outLang, marketplace, brandName, usp, brandVoice, userPrompt,
-      minChars: 3000,
-      maxChars: 4000
+    // 2) Validate
+    const v1 = validateOutput(output, { BULLET_COUNT, BULLET_MIN, BULLET_MAX, DESC_MIN, DESC_MAX });
+    if (v1.ok) return json({ output }, 200);
+
+    // 3) Repair pass (rewrite A–D to satisfy HARD requirements)
+    const repairInstructions = `${instructions}
+
+You MUST fix the output to satisfy the HARD REQUIREMENTS.
+Return again ONLY A–D. Do not add extra commentary.`;
+
+    const repairInput = `${input}
+
+CURRENT OUTPUT (violations found):
+${v1.errors.join("\n")}
+
+Rewrite the output to satisfy the constraints.`;
+
+    const repaired = await callOpenAI(env, repairInstructions, repairInput, {
+      max_output_tokens: variants === 3 ? 8500 : 3600,
+      temperature: 0.65,
+      timeoutMs: 60000
     });
+
+    output = extractText(repaired) || output;
+
+    // 4) Validate again; if still not ok → try targeted description fix once
+    const v2 = validateOutput(output, { BULLET_COUNT, BULLET_MIN, BULLET_MAX, DESC_MIN, DESC_MAX });
+    if (v2.ok) return json({ output }, 200);
+
+    // Targeted description fix (only if description is the remaining issue)
+    const parsed = parseAD(output);
+    if (!parsed.desc) {
+      return json({ output }, 200); // cannot parse; return best effort
+    }
+
+    const descLen = normalizeSpaces(parsed.desc).length;
+    const descBad = descLen < DESC_MIN || descLen > DESC_MAX;
+
+    if (descBad) {
+      const fixedDesc = await fixDescriptionOnly(env, {
+        outLang,
+        marketplace,
+        brandName,
+        usp,
+        brandVoice,
+        userPrompt,
+        DESC_MIN,
+        DESC_MAX,
+        currentDesc: parsed.desc
+      });
+
+      if (fixedDesc) {
+        parsed.desc = fixedDesc;
+        output = rebuildAD(parsed);
+      }
+    }
 
     return json({ output }, 200);
 
@@ -122,47 +170,39 @@ VARIANT C`;
   }
 }
 
-/* ---------------- Enforce DESCRIPTION length ---------------- */
+/* ---------------- VALIDATION ---------------- */
 
-async function enforceDescriptionLength(output, env, ctx) {
-  const variants = splitVariants(output);
+function validateOutput(text, cfg) {
+  const errors = [];
 
-  // Ако няма варианти (single) -> пак ще върне масив с 1 елемент
-  const fixed = [];
+  // if variants exist, validate each variant block
+  const variants = splitVariants(text);
   for (const v of variants) {
-    const parsed = parseAD(v.text);
-    if (!parsed?.desc) {
-      fixed.push(v.label ? `${v.label}\n${v.text}` : v.text);
-      continue;
+    const block = v.text || "";
+    const p = parseAD(block);
+
+    const bullets = splitBullets(p.bullets);
+    if (bullets.length !== cfg.BULLET_COUNT) {
+      errors.push(`${v.label || "OUTPUT"}: bullets count = ${bullets.length}, expected ${cfg.BULLET_COUNT}`);
+    } else {
+      bullets.forEach((b, i) => {
+        const len = normalizeSpaces(b).length;
+        if (len < cfg.BULLET_MIN || len > cfg.BULLET_MAX) {
+          errors.push(`${v.label || "OUTPUT"}: bullet ${i + 1} length = ${len}, expected ${cfg.BULLET_MIN}-${cfg.BULLET_MAX}`);
+        }
+      });
     }
 
-    const descNorm = normalizeSpaces(parsed.desc);
-    const len = descNorm.length;
-
-    if (len >= ctx.minChars && len <= ctx.maxChars) {
-      fixed.push(rebuildVariant(v.label, parsed));
-      continue;
+    const descLen = normalizeSpaces(p.desc).length;
+    if (descLen < cfg.DESC_MIN || descLen > cfg.DESC_MAX) {
+      errors.push(`${v.label || "OUTPUT"}: description length = ${descLen}, expected ${cfg.DESC_MIN}-${cfg.DESC_MAX}`);
     }
-
-    // Втори call – връща САМО DESCRIPTION в 3000–4000 chars
-    const fixedDesc = await fixDescription(env, {
-      outLang: ctx.outLang,
-      minChars: ctx.minChars,
-      maxChars: ctx.maxChars,
-      marketplace: ctx.marketplace,
-      brandName: ctx.brandName,
-      usp: ctx.usp,
-      brandVoice: ctx.brandVoice,
-      userPrompt: ctx.userPrompt,
-      currentDesc: parsed.desc
-    });
-
-    parsed.desc = fixedDesc || parsed.desc;
-    fixed.push(rebuildVariant(v.label, parsed));
   }
 
-  return fixed.join("\n\n").trim();
+  return { ok: errors.length === 0, errors };
 }
+
+/* ---------------- PARSING / REBUILD ---------------- */
 
 function splitVariants(text) {
   const s = String(text || "").trim();
@@ -179,7 +219,6 @@ function splitVariants(text) {
     const start = matches[i].idx;
     const end = (i + 1 < matches.length) ? matches[i + 1].idx : s.length;
     const chunk = s.slice(start, end).trim();
-    // label е първия ред
     const firstLine = chunk.split("\n")[0].trim();
     out.push({ label: firstLine, text: chunk.slice(firstLine.length).trim() });
   }
@@ -189,67 +228,95 @@ function splitVariants(text) {
 function parseAD(text) {
   const t = String(text || "");
 
-  const title = extractBetween(t, "A) TITLE:", "B) BULLET POINTS:");
-  const bullets = extractBetween(t, "B) BULLET POINTS:", "C) DESCRIPTION:");
-  const desc = extractBetween(t, "C) DESCRIPTION:", "D) BACKEND SEARCH TERMS:");
-  const backend = extractAfter(t, "D) BACKEND SEARCH TERMS:");
+  // tolerant markers (allow missing colon, different spacing)
+  const title = extractBetweenAny(t, [/A\)\s*TITLE\s*:/i, /A\)\s*TITLE\s*/i], [/B\)\s*BULLET/i]);
+  const bullets = extractBetweenAny(t, [/B\)\s*BULLET[\s-]*POINTS\s*:/i, /B\)\s*BULLET[\s-]*POINTS/i], [/C\)\s*DESCRIPTION/i]);
+  const desc = extractBetweenAny(t, [/C\)\s*DESCRIPTION\s*:/i, /C\)\s*DESCRIPTION/i], [/D\)\s*BACKEND/i]);
+  const backend = extractAfterAny(t, [/D\)\s*BACKEND[\s-]*SEARCH\s*TERMS\s*:/i, /D\)\s*BACKEND[\s-]*SEARCH\s*TERMS/i]);
 
-  return { title, bullets, desc, backend };
+  return { title: title.trim(), bullets: bullets.trim(), desc: desc.trim(), backend: backend.trim() };
 }
 
-function rebuildVariant(label, p) {
-  const parts = [];
-  if (label) parts.push(label);
-
-  parts.push("A) TITLE:");
-  parts.push((p.title || "").trim());
-
-  parts.push("");
-  parts.push("B) BULLET POINTS:");
-  parts.push((p.bullets || "").trim());
-
-  parts.push("");
-  parts.push("C) DESCRIPTION:");
-  parts.push((p.desc || "").trim());
-
-  parts.push("");
-  parts.push("D) BACKEND SEARCH TERMS:");
-  parts.push((p.backend || "").trim());
-
-  return parts.join("\n").trim();
+function rebuildAD(p) {
+  return [
+    "A) TITLE:",
+    (p.title || "").trim(),
+    "",
+    "B) BULLET POINTS:",
+    (p.bullets || "").trim(),
+    "",
+    "C) DESCRIPTION:",
+    (p.desc || "").trim(),
+    "",
+    "D) BACKEND SEARCH TERMS:",
+    (p.backend || "").trim()
+  ].join("\n").trim();
 }
 
-function extractBetween(text, start, end) {
-  const s = text.indexOf(start);
-  if (s === -1) return "";
-  const from = s + start.length;
-  const e = text.indexOf(end, from);
-  if (e === -1) return text.slice(from).trim();
-  return text.slice(from, e).trim();
+function extractBetweenAny(text, startPatterns, endPatterns) {
+  let startIdx = -1;
+  let startLen = 0;
+
+  for (const sp of startPatterns) {
+    const m = text.match(sp);
+    if (m && m.index != null) {
+      startIdx = m.index;
+      startLen = m[0].length;
+      break;
+    }
+  }
+  if (startIdx === -1) return "";
+
+  const from = startIdx + startLen;
+
+  let endIdx = -1;
+  for (const ep of endPatterns) {
+    const re = new RegExp(ep.source, ep.flags);
+    re.lastIndex = from;
+    const m2 = re.exec(text.slice(from));
+    if (m2 && m2.index != null) {
+      endIdx = from + m2.index;
+      break;
+    }
+  }
+  if (endIdx === -1) return text.slice(from);
+  return text.slice(from, endIdx);
 }
 
-function extractAfter(text, start) {
-  const s = text.indexOf(start);
-  if (s === -1) return "";
-  return text.slice(s + start.length).trim();
+function extractAfterAny(text, startPatterns) {
+  for (const sp of startPatterns) {
+    const m = text.match(sp);
+    if (m && m.index != null) {
+      return text.slice(m.index + m[0].length);
+    }
+  }
+  return "";
+}
+
+function splitBullets(block) {
+  const lines = String(block || "")
+    .split("\n")
+    .map(l => l.trim())
+    .filter(Boolean);
+
+  // allow bullets separated by newline only
+  return lines;
 }
 
 function normalizeSpaces(s) {
   return String(s || "").replace(/\s+/g, " ").trim();
 }
 
-/* ---------------- Fix DESCRIPTION only ---------------- */
+/* ---------------- DESCRIPTION FIX (targeted) ---------------- */
 
-async function fixDescription(env, ctx) {
+async function fixDescriptionOnly(env, ctx) {
   const instr = `You are an Amazon listing copywriter.
-Task: Rewrite ONLY the DESCRIPTION section.
 
 HARD REQUIREMENTS:
 - Language: ${ctx.outLang}
-- LENGTH: ${ctx.minChars}–${ctx.maxChars} characters total (including spaces). Count characters and stay within range.
-- Keep it conversion-oriented, detailed, and readable (multiple paragraphs).
-- No medical claims, no guarantees, comply with Amazon policies.
-- Do NOT output Title, Bullets, Backend terms.
+- DESCRIPTION length MUST be ${ctx.DESC_MIN}–${ctx.DESC_MAX} characters (including spaces).
+- Detailed, multi-paragraph, conversion-oriented, readable.
+- No medical claims, no guarantees.
 - Output ONLY the description text (plain text).`;
 
   const uspLine = ctx.usp ? `USPs: ${ctx.usp}\n` : "";
@@ -262,23 +329,21 @@ ${uspLine}${bvLine}
 Product info:
 ${ctx.userPrompt}
 
-Current (too short/too long) description:
+Current description:
 ${ctx.currentDesc}
 
-Rewrite the description to meet the length requirement.`;
+Rewrite the description to meet the length requirement exactly within range.`;
 
   const data = await callOpenAI(env, instr, inp, {
-    max_output_tokens: 2200,
-    temperature: 0.5,
-    timeoutMs: 45000
+    max_output_tokens: 2600,
+    temperature: 0.55,
+    timeoutMs: 60000
   });
 
   const out = extractText(data);
   const clean = String(out || "").trim();
-
-  // Ако моделът пак не спази – връщаме каквото има, а enforce ще остави старото
   const len = normalizeSpaces(clean).length;
-  if (len < ctx.minChars || len > ctx.maxChars) return "";
+  if (len < ctx.DESC_MIN || len > ctx.DESC_MAX) return "";
   return clean;
 }
 
@@ -286,7 +351,7 @@ Rewrite the description to meet the length requirement.`;
 
 async function callOpenAI(env, instructions, input, { max_output_tokens, temperature, timeoutMs }) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs || 45000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs || 60000);
 
   const resp = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -299,8 +364,8 @@ async function callOpenAI(env, instructions, input, { max_output_tokens, tempera
       model: env.OPENAI_MODEL || "gpt-5.2",
       instructions,
       input,
-      max_output_tokens: max_output_tokens ?? 2600,
-      temperature: temperature ?? 0.6,
+      max_output_tokens: max_output_tokens ?? 3200,
+      temperature: temperature ?? 0.7,
       text: { format: { type: "text" } }
     })
   }).finally(() => clearTimeout(timeout));
@@ -316,8 +381,6 @@ async function callOpenAI(env, instructions, input, { max_output_tokens, tempera
   }
   return data;
 }
-
-/* ---------------- Responses API text extractor ---------------- */
 
 function extractText(data) {
   if (typeof data?.output_text === "string" && data.output_text.trim()) {

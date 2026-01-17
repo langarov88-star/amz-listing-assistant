@@ -107,8 +107,7 @@
 
 <script>
 (() => {
-  const PASS = "Lang881126!";
-  const KEY = "amz_assistant_access_v1";
+  const KEY = "amz_assistant_token_v1";
 
   // Gate elements
   const gate = document.getElementById("gate");
@@ -126,54 +125,85 @@
   const prompt = document.getElementById("prompt");
   const result = document.getElementById("result");
 
-  function hasAccess() {
-    return sessionStorage.getItem(KEY) === "1" || localStorage.getItem(KEY) === "1";
+  function getToken() {
+    return sessionStorage.getItem(KEY) || localStorage.getItem(KEY) || "";
   }
-  function setAccess(persist) {
+  function setToken(token, persist) {
     sessionStorage.removeItem(KEY);
     localStorage.removeItem(KEY);
-    (persist ? localStorage : sessionStorage).setItem(KEY, "1");
+    (persist ? localStorage : sessionStorage).setItem(KEY, token);
   }
-  function clearAccess() {
+  function clearToken() {
     sessionStorage.removeItem(KEY);
     localStorage.removeItem(KEY);
   }
+
   function showApp() {
     gate.style.display = "none";
     app.style.display = "block";
     gateMsg.textContent = "";
     pw.value = "";
   }
-  function showGate() {
+  function showGate(msg = "") {
     app.style.display = "none";
     gate.style.display = "block";
-    gateMsg.textContent = "";
+    gateMsg.textContent = msg;
     pw.value = "";
   }
 
-  // Login / Logout
-  document.getElementById("login").addEventListener("click", () => {
-    if (pw.value === PASS) {
-      setAccess(remember.checked);
-      showApp();
-    } else {
-      gateMsg.textContent = "Грешна парола.";
+  // Login via server (/api/auth)
+  async function login() {
+    gateMsg.textContent = "";
+    const password = pw.value || "";
+    if (!password) {
+      gateMsg.textContent = "Въведи парола.";
+      return;
     }
-  });
+
+    try {
+      const r = await fetch("/api/auth", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ password })
+      });
+
+      const text = await r.text();
+      let data;
+      try { data = JSON.parse(text); } catch { data = { error: text }; }
+
+      if (!r.ok) throw new Error(data?.error || `Auth failed (${r.status})`);
+      if (!data?.token) throw new Error("Missing token from server");
+
+      setToken(data.token, remember.checked);
+      showApp();
+
+    } catch (e) {
+      showGate(String(e?.message || e));
+    }
+  }
+
+  document.getElementById("login").addEventListener("click", login);
 
   pw.addEventListener("keydown", (e) => {
-    if (e.key === "Enter") document.getElementById("login").click();
+    if (e.key === "Enter") login();
   });
 
   document.getElementById("logout").addEventListener("click", () => {
-    clearAccess();
-    showGate();
+    clearToken();
+    showGate("");
   });
 
   // --- Generate helper ---
   async function runGenerate(variants = 1) {
     appMsg.textContent = "";
     result.value = "Генерирам...";
+
+    const token = getToken();
+    if (!token) {
+      result.value = "";
+      showGate("Моля, влез отново.");
+      return;
+    }
 
     const bn = (brandName?.value || "").trim();
     if (!bn) {
@@ -194,14 +224,23 @@
     try {
       const r = await fetch("/api/generate", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${token}`
+        },
         body: JSON.stringify(payload)
       });
 
-      // Safe JSON parse (ако върне HTML/текст грешка, пак ще я покажем)
       const text = await r.text();
       let data;
       try { data = JSON.parse(text); } catch { data = { error: text }; }
+
+      if (r.status === 401) {
+        clearToken();
+        result.value = "";
+        showGate(data?.error || "Сесията е изтекла. Влез отново.");
+        return;
+      }
 
       if (!r.ok) {
         throw new Error(data?.error || `Request failed (${r.status})`);
@@ -217,13 +256,12 @@
 
   // Buttons
   document.getElementById("generate").addEventListener("click", () => runGenerate(1));
-
   const btn3 = document.getElementById("generate3");
   if (btn3) btn3.addEventListener("click", () => runGenerate(3));
 
   // Init
-  if (hasAccess()) showApp();
-  else showGate();
+  if (getToken()) showApp();
+  else showGate("");
 })();
 </script>
 

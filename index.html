@@ -140,9 +140,11 @@
           user_prompt: prompt.value || ""
         })
       });
-      const data = await r.json();
-      if(!r.ok) throw new Error(data?.error || "Request failed");
-      result.value = data.output || "";
+      const text = await r.text();
+let data;
+try { data = JSON.parse(text); } catch { data = { error: text }; }
+if(!r.ok) throw new Error(data?.error || "Request failed");
+result.value = data.output || "";
     }catch(err){
       result.value = "";
       appMsg.textContent = String(err?.message || err);

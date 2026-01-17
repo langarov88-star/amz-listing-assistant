@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="bg">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>AMZ Listing Assistant</title>
+  <style>
+    :root{--border:#e6e6e6;--shadow:0 10px 30px rgba(0,0,0,.06);--r:16px;--r2:12px}
+    body{margin:0;background:#fafafa;color:#111;font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}
+    .wrap{max-width:980px;margin:32px auto;padding:0 14px}
+    .card{background:#fff;border:1px solid var(--border);border-radius:var(--r);padding:18px;box-shadow:var(--shadow)}
+    .top{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px}
+    h1{font-size:22px;margin:0}
+    label{display:block;margin:10px 0 6px;font-size:13px;color:#222}
+    select,input,textarea{width:100%;padding:12px;border:1px solid #ddd;border-radius:var(--r2);font-size:14px;background:#fff}
+    textarea{resize:vertical}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+    @media(max-width:880px){.grid{grid-template-columns:1fr}}
+    .actions{display:flex;gap:10px;flex-wrap:wrap}
+    button{padding:10px 12px;border-radius:var(--r2);border:1px solid #ddd;background:#fff;cursor:pointer}
+    button.primary{background:#111;color:#fff;border:0}
+    .muted{font-size:12px;color:#777;margin-top:6px}
+    .err{color:#c00;font-size:14px;min-height:18px;margin-top:10px}
+    .gate{max-width:420px;margin:60px auto;padding:0 14px}
+    .row{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:10px}
+    .chk{display:flex;align-items:center;gap:8px;font-size:14px}
+    .divider{height:1px;background:#eee;margin:14px 0}
+    .small{font-size:12px;color:#555}
+  </style>
+</head>
+<body>
+
+<div id="gate" class="gate" style="display:none">
+  <div class="card">
+    <h1>Достъп</h1>
+    <p class="small">Въведи парола, за да заредиш инструмента.</p>
+    <input id="pw" type="password" placeholder="Парола" autocomplete="current-password">
+    <div class="row">
+      <label class="chk"><input id="remember" type="checkbox"> Запомни ме</label>
+      <span class="muted">(по избор)</span>
+    </div>
+    <button id="login" class="primary" style="width:100%;margin-top:10px">Влез</button>
+    <div id="gateMsg" class="err"></div>
+  </div>
+</div>
+
+<div id="app" class="wrap" style="display:none">
+  <div class="top">
+    <h1>Amazon Listing AI</h1>
+    <div class="actions">
+      <button id="logout">Изход</button>
+      <button id="generate" class="primary">Generate</button>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="grid">
+      <div>
+        <label for="market">Marketplace</label>
+        <select id="market">
+          <option value="amazon.de">amazon.de</option>
+          <option value="amazon.fr">amazon.fr</option>
+          <option value="amazon.it">amazon.it</option>
+          <option value="amazon.es">amazon.es</option>
+          <option value="amazon.nl">amazon.nl</option>
+          <option value="amazon.pl">amazon.pl</option>
+          <option value="amazon.se">amazon.se</option>
+          <option value="amazon.co.uk">amazon.co.uk</option>
+        </select>
+        <div class="muted">Езикът на резултата следва избрания marketplace.</div>
+      </div>
+
+      <div>
+        <label for="brand">Brand voice (по желание)</label>
+        <input id="brand" placeholder="premium, minimal, friendly, technical...">
+        <div class="muted">Кратко описание на тона/стила.</div>
+      </div>
+    </div>
+
+    <div class="divider"></div>
+
+    <label for="prompt">Prompt (за конкретния продукт)</label>
+    <textarea id="prompt" style="min-height:180px" placeholder="Продукт, материал, размери, USP, забранени думи, конкурентен стил..."></textarea>
+
+    <label for="result">Result</label>
+    <textarea id="result" style="min-height:260px" placeholder="Тук ще се появи готовият листинг..."></textarea>
+
+    <div id="appMsg" class="err"></div>
+  </div>
+</div>
+
+<script>
+(() => {
+  const PASS = "Lang881126!";
+  const KEY = "amz_assistant_access_v1";
+
+  const gate = document.getElementById("gate");
+  const app = document.getElementById("app");
+  const pw = document.getElementById("pw");
+  const remember = document.getElementById("remember");
+  const gateMsg = document.getElementById("gateMsg");
+
+  const appMsg = document.getElementById("appMsg");
+  const market = document.getElementById("market");
+  const brand = document.getElementById("brand");
+  const prompt = document.getElementById("prompt");
+  const result = document.getElementById("result");
+
+  function hasAccess(){
+    return sessionStorage.getItem(KEY)==="1" || localStorage.getItem(KEY)==="1";
+  }
+  function setAccess(persist){
+    sessionStorage.removeItem(KEY); localStorage.removeItem(KEY);
+    (persist ? localStorage : sessionStorage).setItem(KEY,"1");
+  }
+  function clearAccess(){
+    sessionStorage.removeItem(KEY); localStorage.removeItem(KEY);
+  }
+  function showApp(){ gate.style.display="none"; app.style.display="block"; gateMsg.textContent=""; pw.value=""; }
+  function showGate(){ app.style.display="none"; gate.style.display="block"; gateMsg.textContent=""; pw.value=""; }
+
+  document.getElementById("login").addEventListener("click", () => {
+    if (pw.value === PASS) { setAccess(remember.checked); showApp(); }
+    else gateMsg.textContent = "Грешна парола.";
+  });
+  pw.addEventListener("keydown", (e)=>{ if(e.key==="Enter") document.getElementById("login").click(); });
+
+  document.getElementById("logout").addEventListener("click", () => { clearAccess(); showGate(); });
+
+  document.getElementById("generate").addEventListener("click", async () => {
+    appMsg.textContent = "";
+    result.value = "Генерирам...";
+    try{
+      const r = await fetch("/api/generate",{
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({
+          marketplace: market.value,
+          brand_voice: brand.value || "",
+          user_prompt: prompt.value || ""
+        })
+      });
+      const data = await r.json();
+      if(!r.ok) throw new Error(data?.error || "Request failed");
+      result.value = data.output || "";
+    }catch(err){
+      result.value = "";
+      appMsg.textContent = String(err?.message || err);
+    }
+  });
+
+  if(hasAccess()) showApp(); else showGate();
+})();
+</script>
+</body>
+</html>
